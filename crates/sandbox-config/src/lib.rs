@@ -125,6 +125,8 @@ pub struct FilesystemConfig {
     pub rootfs_dir: Option<PathBuf>,
     #[serde(default = "default_enter_mount_namespace")]
     pub enter_mount_namespace: bool,
+    #[serde(default = "default_enter_pid_namespace")]
+    pub enter_pid_namespace: bool,
     #[serde(default = "default_apply_mounts")]
     pub apply_mounts: bool,
     #[serde(default = "default_chroot_to_rootfs")]
@@ -147,6 +149,7 @@ impl Default for FilesystemConfig {
             enable_rootfs: default_rootfs_enabled(),
             rootfs_dir: None,
             enter_mount_namespace: default_enter_mount_namespace(),
+            enter_pid_namespace: default_enter_pid_namespace(),
             apply_mounts: default_apply_mounts(),
             chroot_to_rootfs: default_chroot_to_rootfs(),
             work_dir: default_work_dir(),
@@ -166,6 +169,11 @@ impl FilesystemConfig {
         if self.apply_mounts && !self.enter_mount_namespace {
             return Err(SandboxError::config(
                 "filesystem.apply_mounts requires filesystem.enter_mount_namespace = true",
+            ));
+        }
+        if self.enter_pid_namespace && !self.enter_mount_namespace {
+            return Err(SandboxError::config(
+                "filesystem.enter_pid_namespace requires filesystem.enter_mount_namespace = true",
             ));
         }
         if self.chroot_to_rootfs && !self.apply_mounts {
@@ -232,6 +240,10 @@ const fn default_rootfs_enabled() -> bool {
 }
 
 const fn default_enter_mount_namespace() -> bool {
+    false
+}
+
+const fn default_enter_pid_namespace() -> bool {
     false
 }
 
@@ -305,6 +317,7 @@ mod tests {
         let config = ExecutionConfig::from_toml_str(raw).expect("config should parse");
         assert!(config.filesystem.enable_rootfs);
         assert!(!config.filesystem.enter_mount_namespace);
+        assert!(!config.filesystem.enter_pid_namespace);
         assert!(!config.filesystem.apply_mounts);
         assert!(!config.filesystem.chroot_to_rootfs);
         assert_eq!(config.filesystem.work_dir, PathBuf::from("/work"));
@@ -350,6 +363,20 @@ mod tests {
 
             [filesystem]
             apply_mounts = true
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("enter_mount_namespace"));
+    }
+
+    #[test]
+    fn rejects_pid_namespace_without_mount_namespace() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            enter_pid_namespace = true
         "#;
 
         let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");

@@ -4,6 +4,11 @@ use thiserror::Error;
 pub enum SandboxError {
     #[error("configuration error: {0}")]
     Config(String),
+    #[error("required sandbox capability `{capability}` is unavailable: {detail}")]
+    CapabilityUnavailable {
+        capability: &'static str,
+        detail: String,
+    },
     #[error("I/O error while {context}: {source}")]
     Io {
         context: &'static str,
@@ -25,6 +30,13 @@ pub enum SandboxError {
 impl SandboxError {
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config(message.into())
+    }
+
+    pub fn capability_unavailable(capability: &'static str, detail: impl Into<String>) -> Self {
+        Self::CapabilityUnavailable {
+            capability,
+            detail: detail.into(),
+        }
     }
 
     pub fn io(context: &'static str, source: std::io::Error) -> Self {

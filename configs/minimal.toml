@@ -16,6 +16,7 @@ artifact_dir = ".sandbox-runs/example"
 [filesystem]
 enable_rootfs = true
 enter_mount_namespace = false
+enter_pid_namespace = false
 apply_mounts = false
 chroot_to_rootfs = false
 work_dir = "/work"

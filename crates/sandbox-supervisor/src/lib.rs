@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandbox_config::ExecutionConfig;
 use sandbox_core::{ExecutionResult, ExecutionStatus, ResourceUsage, Result, SandboxError};
-use sandbox_mount::{prepare_rootfs, setup_rootfs};
+use sandbox_mount::{RootfsPlan, mount_proc_in_rootfs, prepare_rootfs, setup_rootfs};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default)]
@@ -49,6 +49,8 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
             "prepared rootfs scaffold"
         );
     }
+
+    ensure_namespace_support(&config)?;
 
     let stdout_path = resolve_output_path(
         &artifact_dir,
@@ -97,7 +99,7 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
                 return Err(std::io::Error::last_os_error());
             }
             if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
-                let _runtime = setup_rootfs(&filesystem, &artifact_dir, rootfs_cwd.as_deref())
+                let runtime = setup_rootfs(&filesystem, &artifact_dir, rootfs_cwd.as_deref())
                     .map_err(|err| {
                         let _ = fs::write(
                             artifact_dir.join("rootfs-preexec-error.log"),
@@ -105,15 +107,27 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
                         );
                         std::io::Error::other(err)
                     })?;
+                if filesystem.enter_pid_namespace {
+                    enter_pid_namespace_for_exec(
+                        filesystem.mount_proc.then_some(&runtime.plan),
+                        &artifact_dir,
+                    )?;
+                }
             }
             Ok(())
         });
     }
 
     info!(command = ?command, artifact_dir = %artifact_dir.display(), "spawning sandbox payload");
-    let mut child = process
-        .spawn()
-        .map_err(|err| SandboxError::Spawn(err.to_string()))?;
+    let preexec_log = artifact_dir.join("rootfs-preexec-error.log");
+    let _ = fs::remove_file(&preexec_log);
+    let mut child = process.spawn().map_err(|err| {
+        let detail = fs::read_to_string(&preexec_log)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| err.to_string());
+        SandboxError::Spawn(detail)
+    })?;
     let wall_limit = Duration::from_millis(config.limits.wall_time_ms);
     let wait_outcome = wait_for_exit(&mut child, wall_limit)?;
 
@@ -146,6 +160,169 @@ fn rootfs_cwd(config: &ExecutionConfig) -> Option<PathBuf> {
         Some(cwd) => Some(config.filesystem.work_dir.join(cwd)),
         None => Some(config.filesystem.work_dir.clone()),
     }
+}
+
+fn ensure_namespace_support(config: &ExecutionConfig) -> Result<()> {
+    let support = probe_namespace_support();
+    if config.filesystem.enter_mount_namespace && !support.mount_namespace {
+        return Err(SandboxError::capability_unavailable(
+            "mount_namespace",
+            support
+                .mount_reason
+                .unwrap_or_else(|| "unknown mount namespace error".to_string()),
+        ));
+    }
+    if config.filesystem.enter_pid_namespace && !support.pid_namespace {
+        return Err(SandboxError::capability_unavailable(
+            "pid_namespace",
+            support
+                .pid_reason
+                .unwrap_or_else(|| "unknown pid namespace error".to_string()),
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct NamespaceSupport {
+    mount_namespace: bool,
+    mount_reason: Option<String>,
+    pid_namespace: bool,
+    pid_reason: Option<String>,
+}
+
+fn probe_namespace_support() -> NamespaceSupport {
+    NamespaceSupport {
+        mount_namespace: probe_unshare_support(libc::CLONE_NEWNS).is_ok(),
+        mount_reason: probe_unshare_support(libc::CLONE_NEWNS).err(),
+        pid_namespace: probe_unshare_support(libc::CLONE_NEWPID).is_ok(),
+        pid_reason: probe_unshare_support(libc::CLONE_NEWPID).err(),
+    }
+}
+
+fn probe_unshare_support(flag: libc::c_int) -> std::result::Result<(), String> {
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+        return Err(format!(
+            "fork failed while probing namespace support: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    if pid == 0 {
+        let result = unsafe { libc::unshare(flag) };
+        let code = if result == -1 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(1)
+        } else {
+            0
+        };
+        unsafe { libc::_exit(code.min(255)) }
+    }
+
+    let status = waitpid_status(pid)?;
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        if code == 0 {
+            return Ok(());
+        }
+        return Err(format!(
+            "{} failed with errno {} ({})",
+            namespace_name(flag),
+            code,
+            std::io::Error::from_raw_os_error(code)
+        ));
+    }
+
+    Err(format!(
+        "{} probe did not exit normally",
+        namespace_name(flag)
+    ))
+}
+
+fn enter_pid_namespace_for_exec(
+    proc_plan: Option<&RootfsPlan>,
+    artifact_dir: &Path,
+) -> std::io::Result<()> {
+    let result = unsafe { libc::unshare(libc::CLONE_NEWPID) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if pid == 0 {
+        if let Some(plan) = proc_plan {
+            mount_proc_in_rootfs(plan).map_err(|err| {
+                let _ = fs::write(
+                    artifact_dir.join("rootfs-preexec-error.log"),
+                    err.to_string(),
+                );
+                std::io::Error::other(err)
+            })?;
+        }
+        return Ok(());
+    }
+
+    relay_child_exit_status(pid)
+}
+
+fn relay_child_exit_status(pid: libc::pid_t) -> ! {
+    let status = match waitpid_status(pid) {
+        Ok(status) => status,
+        Err(message) => {
+            let _ = writeln_stderr(&message);
+            unsafe { libc::_exit(1) }
+        }
+    };
+
+    if libc::WIFEXITED(status) {
+        unsafe { libc::_exit(libc::WEXITSTATUS(status)) }
+    }
+
+    if libc::WIFSIGNALED(status) {
+        let signal = libc::WTERMSIG(status);
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::kill(libc::getpid(), signal);
+            libc::_exit(128 + signal);
+        }
+    }
+
+    unsafe { libc::_exit(1) }
+}
+
+fn waitpid_status(pid: libc::pid_t) -> std::result::Result<libc::c_int, String> {
+    let mut status = 0;
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(format!("waitpid failed: {err}"));
+        }
+        return Ok(status);
+    }
+}
+
+fn namespace_name(flag: libc::c_int) -> &'static str {
+    match flag {
+        libc::CLONE_NEWNS => "mount namespace probe",
+        libc::CLONE_NEWPID => "pid namespace probe",
+        _ => "namespace probe",
+    }
+}
+
+fn writeln_stderr(message: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut stderr = std::io::stderr().lock();
+    writeln!(stderr, "{message}")
 }
 
 fn open_stdin(path: Option<&Path>) -> Result<Stdio> {
@@ -259,10 +436,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sandbox_config::ExecutionConfig;
-    use sandbox_core::ExecutionStatus;
+    use sandbox_core::{ExecutionStatus, SandboxError};
     use sandbox_testkit::Scenario;
 
-    use crate::{RunOptions, rootfs_cwd, run};
+    use crate::{RunOptions, probe_namespace_support, rootfs_cwd, run};
 
     #[test]
     fn executes_simple_command() {
@@ -420,8 +597,47 @@ mod tests {
     }
 
     #[test]
+    fn reports_capability_error_when_mount_namespace_is_unavailable() {
+        let support = probe_namespace_support();
+        if support.mount_namespace {
+            return;
+        }
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [filesystem]
+                enable_rootfs = true
+                enter_mount_namespace = true
+            "#,
+        )
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("unsupported-mount")),
+            },
+        )
+        .expect_err("run should fail");
+
+        match err {
+            SandboxError::CapabilityUnavailable { capability, .. } => {
+                assert_eq!(capability, "mount_namespace");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
     #[ignore = "requires mount namespace and chroot privileges in the test environment"]
     fn can_write_inside_sandbox_workdir_when_mounts_are_enabled() {
+        if !probe_namespace_support().mount_namespace || !probe_namespace_support().pid_namespace {
+            return;
+        }
         let artifact_dir = unique_artifact_dir("workdir-probe");
         let config = ExecutionConfig::from_toml_str(&format!(
             r#"
@@ -434,6 +650,7 @@ mod tests {
                 [filesystem]
                 enable_rootfs = true
                 enter_mount_namespace = true
+                enter_pid_namespace = true
                 apply_mounts = true
                 chroot_to_rootfs = true
                 work_dir = "/work"
@@ -460,6 +677,9 @@ mod tests {
     #[test]
     #[ignore = "requires mount namespace and chroot privileges in the test environment"]
     fn hides_host_file_after_chroot() {
+        if !probe_namespace_support().mount_namespace || !probe_namespace_support().pid_namespace {
+            return;
+        }
         let artifact_dir = unique_artifact_dir("host-visibility");
         fs::create_dir_all(&artifact_dir).expect("artifact dir should exist");
         fs::write(artifact_dir.join("host-secret.txt"), "secret").expect("host file should exist");
@@ -475,6 +695,7 @@ mod tests {
                 [filesystem]
                 enable_rootfs = true
                 enter_mount_namespace = true
+                enter_pid_namespace = true
                 apply_mounts = true
                 chroot_to_rootfs = true
                 work_dir = "/work"
@@ -500,6 +721,9 @@ mod tests {
     #[test]
     #[ignore = "requires mount namespace and chroot privileges in the test environment"]
     fn mounts_minimal_proc_inside_rootfs() {
+        if !probe_namespace_support().mount_namespace || !probe_namespace_support().pid_namespace {
+            return;
+        }
         let artifact_dir = unique_artifact_dir("proc-visibility");
         let config = ExecutionConfig::from_toml_str(&format!(
             r#"
@@ -512,6 +736,7 @@ mod tests {
                 [filesystem]
                 enable_rootfs = true
                 enter_mount_namespace = true
+                enter_pid_namespace = true
                 apply_mounts = true
                 chroot_to_rootfs = true
                 work_dir = "/work"

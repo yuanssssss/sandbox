@@ -52,6 +52,19 @@ pub struct RootfsRuntime {
     pub chroot_applied: bool,
 }
 
+pub fn cleanup_rootfs_artifacts(plan: &RootfsPlan) -> Result<()> {
+    cleanup_path(&plan.layout.root, "removing stale rootfs directory")?;
+    cleanup_path(
+        &plan.layout.host_work_dir,
+        "removing stale host work directory",
+    )?;
+    cleanup_path(
+        &plan.layout.host_tmp_dir,
+        "removing stale host tmp directory",
+    )?;
+    Ok(())
+}
+
 pub fn prepare_rootfs(config: &FilesystemConfig, artifact_dir: &Path) -> Result<RootfsPlan> {
     if !config.enable_rootfs {
         return Err(SandboxError::config(
@@ -73,6 +86,11 @@ pub fn prepare_rootfs(config: &FilesystemConfig, artifact_dir: &Path) -> Result<
         sandbox_proc_dir: config.mount_proc.then(|| PathBuf::from("/proc")),
     };
 
+    let empty_plan = RootfsPlan {
+        layout: layout.clone(),
+        mounts: Vec::new(),
+    };
+    cleanup_rootfs_artifacts(&empty_plan)?;
     materialize_rootfs_layout(&layout)?;
 
     let mut mounts = Vec::new();
@@ -155,8 +173,11 @@ pub fn enter_mount_namespace() -> Result<()> {
     Ok(())
 }
 
-pub fn apply_rootfs(plan: &RootfsPlan) -> Result<()> {
+pub fn apply_rootfs(plan: &RootfsPlan, include_proc_mount: bool) -> Result<()> {
     for mount in &plan.mounts {
+        if !include_proc_mount && mount.kind == MountKind::Proc {
+            continue;
+        }
         apply_mount(plan, mount)?;
     }
     Ok(())
@@ -215,7 +236,7 @@ pub fn setup_rootfs(
         runtime.namespace_entered = true;
     }
     if config.apply_mounts {
-        apply_rootfs(&runtime.plan)?;
+        apply_rootfs(&runtime.plan, !config.enter_pid_namespace)?;
         runtime.mounts_applied = true;
     }
     if config.chroot_to_rootfs {
@@ -241,6 +262,28 @@ fn materialize_rootfs_layout(layout: &RootfsLayout) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn mount_proc_in_rootfs(plan: &RootfsPlan) -> Result<()> {
+    if let Some(proc_dir) = &plan.layout.sandbox_proc_dir {
+        let mount = MountPlanEntry {
+            kind: MountKind::Proc,
+            source: None,
+            target: proc_dir.clone(),
+            flags: vec!["nosuid".into(), "nodev".into(), "noexec".into()],
+        };
+        apply_mount(plan, &mount)?;
+    }
+
+    Ok(())
+}
+
+fn cleanup_path(path: &Path, context: &'static str) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(SandboxError::io(context, err)),
+    }
 }
 
 fn materialize_mount_target(root: &Path, sandbox_path: &Path) -> Result<()> {
@@ -403,12 +446,15 @@ pub fn roadmap() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sandbox_config::FilesystemConfig;
 
-    use crate::{MountKind, host_mount_target, prepare_rootfs};
+    use crate::{
+        MountKind, RootfsPlan, cleanup_rootfs_artifacts, host_mount_target, prepare_rootfs,
+    };
 
     #[test]
     fn prepares_rootfs_layout_and_mounts() {
@@ -468,6 +514,30 @@ mod tests {
             .expect("host target should resolve");
 
         assert_eq!(host_target, PathBuf::from("/sandbox/rootfs/usr/lib"));
+    }
+
+    #[test]
+    fn cleans_up_existing_rootfs_artifacts() {
+        let artifact_dir = unique_dir("cleanup");
+        let plan = RootfsPlan {
+            layout: super::RootfsLayout {
+                root: artifact_dir.join("rootfs"),
+                host_work_dir: artifact_dir.join("work"),
+                host_tmp_dir: artifact_dir.join("tmp"),
+                sandbox_work_dir: PathBuf::from("/work"),
+                sandbox_tmp_dir: PathBuf::from("/tmp"),
+                sandbox_proc_dir: Some(PathBuf::from("/proc")),
+            },
+            mounts: Vec::new(),
+        };
+        fs::create_dir_all(plan.layout.root.join("stale")).expect("stale rootfs should exist");
+        fs::create_dir_all(plan.layout.host_work_dir.join("stale"))
+            .expect("stale work dir should exist");
+
+        cleanup_rootfs_artifacts(&plan).expect("cleanup should succeed");
+
+        assert!(!plan.layout.root.exists());
+        assert!(!plan.layout.host_work_dir.exists());
     }
 
     fn unique_dir(prefix: &str) -> PathBuf {
