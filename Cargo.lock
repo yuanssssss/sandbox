@@ -295,6 +295,7 @@ dependencies = [
 name = "sandbox-mount"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "sandbox-config",
  "sandbox-core",
 ]
@@ -323,6 +324,7 @@ dependencies = [
  "sandbox-config",
  "sandbox-core",
  "sandbox-mount",
+ "sandbox-testkit",
  "tracing",
 ]
 

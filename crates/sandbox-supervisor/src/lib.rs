@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandbox_config::ExecutionConfig;
 use sandbox_core::{ExecutionResult, ExecutionStatus, ResourceUsage, Result, SandboxError};
-use sandbox_mount::prepare_rootfs;
+use sandbox_mount::{prepare_rootfs, setup_rootfs};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default)]
@@ -75,8 +75,11 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
     process.stdout(Stdio::from(stdout));
     process.stderr(Stdio::from(stderr));
 
-    if let Some(cwd) = &config.process.cwd {
-        process.current_dir(cwd);
+    let rootfs_cwd = rootfs_cwd(config);
+    if !config.filesystem.chroot_to_rootfs {
+        if let Some(cwd) = &config.process.cwd {
+            process.current_dir(cwd);
+        }
     }
     if config.process.clear_env {
         process.env_clear();
@@ -86,9 +89,22 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
     }
 
     unsafe {
-        process.pre_exec(|| {
+        let filesystem = config.filesystem.clone();
+        let artifact_dir = artifact_dir.clone();
+        let rootfs_cwd = rootfs_cwd.clone();
+        process.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
+                let _runtime = setup_rootfs(&filesystem, &artifact_dir, rootfs_cwd.as_deref())
+                    .map_err(|err| {
+                        let _ = fs::write(
+                            artifact_dir.join("rootfs-preexec-error.log"),
+                            err.to_string(),
+                        );
+                        std::io::Error::other(err)
+                    })?;
             }
             Ok(())
         });
@@ -118,6 +134,18 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
         stderr_path,
         status,
     })
+}
+
+fn rootfs_cwd(config: &ExecutionConfig) -> Option<PathBuf> {
+    if !config.filesystem.chroot_to_rootfs {
+        return config.process.cwd.clone();
+    }
+
+    match &config.process.cwd {
+        Some(cwd) if cwd.is_absolute() => Some(cwd.clone()),
+        Some(cwd) => Some(config.filesystem.work_dir.join(cwd)),
+        None => Some(config.filesystem.work_dir.clone()),
+    }
 }
 
 fn open_stdin(path: Option<&Path>) -> Result<Stdio> {
@@ -226,13 +254,15 @@ fn classify_status(timed_out: bool, exit_status: &ExitStatus) -> ExecutionStatus
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sandbox_config::ExecutionConfig;
     use sandbox_core::ExecutionStatus;
+    use sandbox_testkit::Scenario;
 
-    use crate::{RunOptions, run};
+    use crate::{RunOptions, rootfs_cwd, run};
 
     #[test]
     fn executes_simple_command() {
@@ -320,6 +350,189 @@ mod tests {
         assert!(artifact_dir.join("rootfs/tmp").exists());
         assert!(artifact_dir.join("rootfs/proc").exists());
         assert!(artifact_dir.join("work").exists());
+    }
+
+    #[test]
+    fn keeps_running_with_default_rootfs_flags() {
+        let artifact_dir = unique_artifact_dir("default-rootfs");
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+    }
+
+    #[test]
+    fn resolves_chroot_cwd_from_relative_process_cwd() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+                cwd = "job"
+
+                [filesystem]
+                enable_rootfs = true
+                chroot_to_rootfs = false
+            "#,
+        )
+        .expect("config should parse");
+
+        let regular_cwd = rootfs_cwd(&config).expect("cwd should resolve");
+        assert_eq!(regular_cwd, PathBuf::from("job"));
+
+        let chroot_config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+                cwd = "job"
+
+                [filesystem]
+                enable_rootfs = true
+                enter_mount_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                work_dir = "/work"
+            "#,
+        )
+        .expect("config should parse");
+
+        let chroot_cwd = rootfs_cwd(&chroot_config).expect("cwd should resolve");
+        assert_eq!(chroot_cwd, PathBuf::from("/work/job"));
+    }
+
+    #[test]
+    #[ignore = "requires mount namespace and chroot privileges in the test environment"]
+    fn can_write_inside_sandbox_workdir_when_mounts_are_enabled() {
+        let artifact_dir = unique_artifact_dir("workdir-probe");
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "{script}"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_mount_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                work_dir = "/work"
+                tmp_dir = "/tmp"
+                executable_bind_paths = ["/bin", "/usr/bin"]
+            "#,
+            script = Scenario::WorkDirWriteProbe.shell_snippet()
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir.clone()),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        assert!(artifact_dir.join("work/probe.txt").exists());
+    }
+
+    #[test]
+    #[ignore = "requires mount namespace and chroot privileges in the test environment"]
+    fn hides_host_file_after_chroot() {
+        let artifact_dir = unique_artifact_dir("host-visibility");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir should exist");
+        fs::write(artifact_dir.join("host-secret.txt"), "secret").expect("host file should exist");
+
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "{script}"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_mount_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                work_dir = "/work"
+                tmp_dir = "/tmp"
+                executable_bind_paths = ["/bin", "/usr/bin"]
+            "#,
+            script = Scenario::HostVisibilityProbe.shell_snippet()
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+    }
+
+    #[test]
+    #[ignore = "requires mount namespace and chroot privileges in the test environment"]
+    fn mounts_minimal_proc_inside_rootfs() {
+        let artifact_dir = unique_artifact_dir("proc-visibility");
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "{script}"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_mount_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                work_dir = "/work"
+                tmp_dir = "/tmp"
+                mount_proc = true
+                executable_bind_paths = ["/bin", "/usr/bin"]
+            "#,
+            script = Scenario::ProcVisibilityProbe.shell_snippet()
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
     }
 
     fn unique_artifact_dir(prefix: &str) -> PathBuf {

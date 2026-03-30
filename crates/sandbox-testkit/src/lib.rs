@@ -3,6 +3,9 @@ pub enum Scenario {
     Echo,
     Timeout,
     RuntimeError,
+    WorkDirWriteProbe,
+    HostVisibilityProbe,
+    ProcVisibilityProbe,
 }
 
 impl Scenario {
@@ -11,6 +14,9 @@ impl Scenario {
             Self::Echo => "printf 'hello\\n'",
             Self::Timeout => "sleep 5",
             Self::RuntimeError => "exit 42",
+            Self::WorkDirWriteProbe => "pwd && touch /work/probe.txt && test -f /work/probe.txt",
+            Self::HostVisibilityProbe => "test ! -e /host-secret.txt",
+            Self::ProcVisibilityProbe => "test -d /proc && test -r /proc/self/status",
         }
     }
 }

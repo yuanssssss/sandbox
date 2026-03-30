@@ -11,3 +11,6 @@ sandbox-config = { path = "../sandbox-config" }
 sandbox-core = { path = "../sandbox-core" }
 sandbox-mount = { path = "../sandbox-mount" }
 tracing.workspace = true
+
+[dev-dependencies]
+sandbox-testkit = { path = "../sandbox-testkit" }

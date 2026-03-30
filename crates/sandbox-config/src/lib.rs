@@ -123,12 +123,20 @@ pub struct FilesystemConfig {
     #[serde(default = "default_rootfs_enabled")]
     pub enable_rootfs: bool,
     pub rootfs_dir: Option<PathBuf>,
+    #[serde(default = "default_enter_mount_namespace")]
+    pub enter_mount_namespace: bool,
+    #[serde(default = "default_apply_mounts")]
+    pub apply_mounts: bool,
+    #[serde(default = "default_chroot_to_rootfs")]
+    pub chroot_to_rootfs: bool,
     #[serde(default = "default_work_dir")]
     pub work_dir: PathBuf,
     #[serde(default = "default_tmp_dir")]
     pub tmp_dir: PathBuf,
     #[serde(default = "default_runtime_bind_paths")]
     pub runtime_bind_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub executable_bind_paths: Vec<PathBuf>,
     #[serde(default = "default_mount_proc")]
     pub mount_proc: bool,
 }
@@ -138,9 +146,13 @@ impl Default for FilesystemConfig {
         Self {
             enable_rootfs: default_rootfs_enabled(),
             rootfs_dir: None,
+            enter_mount_namespace: default_enter_mount_namespace(),
+            apply_mounts: default_apply_mounts(),
+            chroot_to_rootfs: default_chroot_to_rootfs(),
             work_dir: default_work_dir(),
             tmp_dir: default_tmp_dir(),
             runtime_bind_paths: default_runtime_bind_paths(),
+            executable_bind_paths: Vec::new(),
             mount_proc: default_mount_proc(),
         }
     }
@@ -150,6 +162,16 @@ impl FilesystemConfig {
     pub fn validate(&self) -> Result<()> {
         if !self.enable_rootfs {
             return Ok(());
+        }
+        if self.apply_mounts && !self.enter_mount_namespace {
+            return Err(SandboxError::config(
+                "filesystem.apply_mounts requires filesystem.enter_mount_namespace = true",
+            ));
+        }
+        if self.chroot_to_rootfs && !self.apply_mounts {
+            return Err(SandboxError::config(
+                "filesystem.chroot_to_rootfs requires filesystem.apply_mounts = true",
+            ));
         }
 
         if !self.work_dir.is_absolute() {
@@ -167,6 +189,15 @@ impl FilesystemConfig {
             if !path.is_absolute() {
                 return Err(SandboxError::config(format!(
                     "filesystem.runtime_bind_paths must contain absolute paths: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        for path in &self.executable_bind_paths {
+            if !path.is_absolute() {
+                return Err(SandboxError::config(format!(
+                    "filesystem.executable_bind_paths must contain absolute paths: {}",
                     path.display()
                 )));
             }
@@ -198,6 +229,18 @@ const fn default_wall_time_ms() -> u64 {
 
 const fn default_rootfs_enabled() -> bool {
     true
+}
+
+const fn default_enter_mount_namespace() -> bool {
+    false
+}
+
+const fn default_apply_mounts() -> bool {
+    false
+}
+
+const fn default_chroot_to_rootfs() -> bool {
+    false
 }
 
 fn default_work_dir() -> PathBuf {
@@ -261,10 +304,14 @@ mod tests {
 
         let config = ExecutionConfig::from_toml_str(raw).expect("config should parse");
         assert!(config.filesystem.enable_rootfs);
+        assert!(!config.filesystem.enter_mount_namespace);
+        assert!(!config.filesystem.apply_mounts);
+        assert!(!config.filesystem.chroot_to_rootfs);
         assert_eq!(config.filesystem.work_dir, PathBuf::from("/work"));
         assert_eq!(config.filesystem.tmp_dir, PathBuf::from("/tmp"));
         assert!(config.filesystem.mount_proc);
         assert_eq!(config.filesystem.runtime_bind_paths.len(), 3);
+        assert!(config.filesystem.executable_bind_paths.is_empty());
     }
 
     #[test]
@@ -279,5 +326,48 @@ mod tests {
 
         let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
         assert!(err.to_string().contains("runtime_bind_paths"));
+    }
+
+    #[test]
+    fn rejects_relative_executable_bind_path() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            executable_bind_paths = ["bin"]
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("executable_bind_paths"));
+    }
+
+    #[test]
+    fn rejects_apply_mounts_without_mount_namespace() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            apply_mounts = true
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("enter_mount_namespace"));
+    }
+
+    #[test]
+    fn rejects_chroot_without_mounts() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            enter_mount_namespace = true
+            chroot_to_rootfs = true
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("apply_mounts"));
     }
 }

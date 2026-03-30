@@ -23,6 +23,8 @@
   - 在产物目录下准备最小 rootfs 目录结构
   - 生成只读运行库、`/work`、`/tmp`、`/proc` 的挂载计划
   - 为后续 `mount namespace` 和 `pivot_root/chroot` 接入保留生命周期入口
+  - 已接入默认关闭的 `enter_mount_namespace` / `apply_mounts` / `chroot_to_rootfs` 开关
+  - 已支持把可执行目录单独绑定进 rootfs，例如 `/bin`、`/usr/bin`
 
 ## Workspace 结构
 
