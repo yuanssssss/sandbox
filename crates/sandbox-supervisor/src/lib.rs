@@ -985,7 +985,7 @@ mod tests {
     use sandbox_cgroup::{CgroupManager, CgroupPlan};
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{ExecutionStatus, SandboxError};
-    use sandbox_testkit::Scenario;
+    use sandbox_testkit::{ResourceScenario, Scenario};
 
     use crate::{RunOptions, cgroup_scope_name, probe_namespace_support, rootfs_cwd, run};
 
@@ -1932,23 +1932,93 @@ mod tests {
     }
 
     #[test]
+    fn keeps_ok_status_when_cpu_usage_stays_within_limit() {
+        let artifact_dir = unique_artifact_dir("cgroup-cpu-ok");
+        let cgroup_root = unique_artifact_dir("cgroup-cpu-ok-root");
+        fs::create_dir_all(&cgroup_root).expect("cgroup root should exist");
+        fs::write(cgroup_root.join("cgroup.controllers"), "memory pids cpu\n")
+            .expect("controllers should exist");
+        let cgroup_dir = cgroup_root.join(cgroup_scope_name(&artifact_dir));
+
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "printf 'usage_usec 25000\n' > {cpu_stat}; exit 0"]
+
+                [limits]
+                wall_time_ms = 1000
+                cpu_time_ms = 40
+            "#,
+            cpu_stat = shell_single_quote(&cgroup_dir.join("cpu.stat")),
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+                cgroup_root_override: Some(cgroup_root),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        assert_eq!(result.usage.cpu_time_ms, Some(25));
+    }
+
+    #[test]
+    fn keeps_ok_status_when_memory_usage_stays_within_limit() {
+        let artifact_dir = unique_artifact_dir("cgroup-memory-ok");
+        let cgroup_root = unique_artifact_dir("cgroup-memory-ok-root");
+        fs::create_dir_all(&cgroup_root).expect("cgroup root should exist");
+        fs::write(cgroup_root.join("cgroup.controllers"), "memory pids cpu\n")
+            .expect("controllers should exist");
+        let cgroup_dir = cgroup_root.join(cgroup_scope_name(&artifact_dir));
+
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "printf 'usage_usec 8000\n' > {cpu_stat}; printf '4096\n' > {memory_current}; printf '12288\n' > {memory_peak}; printf '1\n' > {pids_current}; printf 'low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n' > {memory_events}; exit 0"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 16384
+            "#,
+            cpu_stat = shell_single_quote(&cgroup_dir.join("cpu.stat")),
+            memory_current = shell_single_quote(&cgroup_dir.join("memory.current")),
+            memory_peak = shell_single_quote(&cgroup_dir.join("memory.peak")),
+            pids_current = shell_single_quote(&cgroup_dir.join("pids.current")),
+            memory_events = shell_single_quote(&cgroup_dir.join("memory.events")),
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+                cgroup_root_override: Some(cgroup_root),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        assert_eq!(result.usage.cpu_time_ms, Some(8));
+        assert_eq!(result.usage.memory_peak_bytes, Some(12_288));
+    }
+
+    #[test]
     #[ignore = "requires writable cgroup v2 support in the test environment"]
     fn enforces_pids_max_against_fork_attempts() {
         if !supports_writable_cgroup_v2() {
             return;
         }
 
-        let config = ExecutionConfig::from_toml_str(
-            r#"
-                [process]
-                argv = ["/usr/bin/python3", "-c", "import os; import sys; exec(\"try:\\n os.fork()\\n raise SystemExit(1)\\nexcept OSError as err:\\n print(err.errno)\\n raise SystemExit(0 if err.errno == 11 else 2)\")"]
-
-                [limits]
-                wall_time_ms = 1000
-                max_processes = 1
-            "#,
-        )
-        .expect("config should parse");
+        let config = resource_scenario_config(
+            ResourceScenario::ForkBombProbe,
+            "wall_time_ms = 1000\nmax_processes = 1",
+        );
 
         let result = run(
             &config,
@@ -1972,17 +2042,10 @@ mod tests {
             return;
         }
 
-        let config = ExecutionConfig::from_toml_str(
-            r#"
-                [process]
-                argv = ["/usr/bin/python3", "-c", "import os; exec(\"pid = os.fork()\\nif pid == 0:\\n raise SystemExit(0)\\nended_pid, status = os.waitpid(pid, 0)\\nprint(ended_pid > 0)\\nraise SystemExit(0 if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else 1)\")"]
-
-                [limits]
-                wall_time_ms = 1000
-                max_processes = 4
-            "#,
-        )
-        .expect("config should parse");
+        let config = resource_scenario_config(
+            ResourceScenario::SmallProcessTree,
+            "wall_time_ms = 1000\nmax_processes = 4",
+        );
 
         let result = run(
             &config,
@@ -2006,17 +2069,10 @@ mod tests {
             return;
         }
 
-        let config = ExecutionConfig::from_toml_str(
-            r#"
-                [process]
-                argv = ["/usr/bin/python3", "-c", "while True: pass"]
-
-                [limits]
-                wall_time_ms = 3000
-                cpu_time_ms = 100
-            "#,
-        )
-        .expect("config should parse");
+        let config = resource_scenario_config(
+            ResourceScenario::CpuBusyLoop,
+            "wall_time_ms = 3000\ncpu_time_ms = 100",
+        );
 
         let result = run(
             &config,
@@ -2034,22 +2090,43 @@ mod tests {
 
     #[test]
     #[ignore = "requires writable cgroup v2 support in the test environment"]
+    fn allows_real_cpu_bound_workload_within_limit() {
+        if !supports_writable_cgroup_v2() {
+            return;
+        }
+
+        let config = resource_scenario_config(
+            ResourceScenario::CpuBoundSuccess,
+            "wall_time_ms = 3000\ncpu_time_ms = 1000",
+        );
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("cgroup-cpu-allow")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "True");
+        assert!(result.usage.cpu_time_ms.is_some());
+    }
+
+    #[test]
+    #[ignore = "requires writable cgroup v2 support in the test environment"]
     fn maps_real_memory_max_oom_to_memory_limit_exceeded() {
         if !supports_writable_cgroup_v2() {
             return;
         }
 
-        let config = ExecutionConfig::from_toml_str(
-            r#"
-                [process]
-                argv = ["/usr/bin/python3", "-c", "chunks = []; chunk = b'x' * (1024 * 1024); exec(\"while True:\\n chunks.append(chunk[:])\")"]
-
-                [limits]
-                wall_time_ms = 3000
-                memory_bytes = 8388608
-            "#,
-        )
-        .expect("config should parse");
+        let config = resource_scenario_config(
+            ResourceScenario::MemoryBomb,
+            "wall_time_ms = 3000\nmemory_bytes = 8388608",
+        );
 
         let result = run(
             &config,
@@ -2063,6 +2140,48 @@ mod tests {
 
         assert_eq!(result.status, ExecutionStatus::MemoryLimitExceeded);
         assert!(result.usage.memory_peak_bytes.is_some());
+    }
+
+    #[test]
+    #[ignore = "requires writable cgroup v2 support in the test environment"]
+    fn allows_real_memory_allocation_within_limit() {
+        if !supports_writable_cgroup_v2() {
+            return;
+        }
+
+        let config = resource_scenario_config(
+            ResourceScenario::MemoryWithinLimit,
+            "wall_time_ms = 3000\nmemory_bytes = 16777216",
+        );
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("cgroup-memory-allow")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "1048576");
+        assert!(result.usage.memory_peak_bytes.is_some());
+    }
+
+    fn resource_scenario_config(scenario: ResourceScenario, limits_body: &str) -> ExecutionConfig {
+        let argv = format!("{:?}", scenario.argv());
+        ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = {argv}
+
+                [limits]
+                {limits_body}
+            "#
+        ))
+        .expect("config should parse")
     }
 
     fn unique_artifact_dir(prefix: &str) -> PathBuf {
