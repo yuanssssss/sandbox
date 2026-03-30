@@ -279,6 +279,7 @@ name = "sandbox-config"
 version = "0.1.0"
 dependencies = [
  "sandbox-core",
+ "sandbox-seccomp",
  "serde",
  "toml",
 ]
@@ -314,6 +315,7 @@ name = "sandbox-seccomp"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -324,6 +326,7 @@ dependencies = [
  "sandbox-config",
  "sandbox-core",
  "sandbox-mount",
+ "sandbox-seccomp",
  "sandbox-testkit",
  "tracing",
 ]

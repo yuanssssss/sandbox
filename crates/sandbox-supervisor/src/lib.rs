@@ -11,6 +11,7 @@ use sandbox_mount::{
     RootfsPlan, apply_rootfs, chroot_into_rootfs, enter_mount_namespace, mount_proc_in_rootfs,
     prepare_rootfs,
 };
+use sandbox_seccomp::install as install_seccomp;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default)]
@@ -95,6 +96,7 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
 
     unsafe {
         let filesystem = config.filesystem.clone();
+        let security = config.security.clone();
         let artifact_dir = artifact_dir.clone();
         let rootfs_cwd = rootfs_cwd.clone();
         let outside_uid = libc::geteuid() as u32;
@@ -175,6 +177,14 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
                     err
                 })?;
             }
+            install_seccomp(security.seccomp_profile).map_err(|err| {
+                let io_err = std::io::Error::other(err.to_string());
+                let _ = fs::write(
+                    artifact_dir.join("rootfs-preexec-error.log"),
+                    format!("install_seccomp failed: {err}"),
+                );
+                io_err
+            })?;
             Ok(())
         });
     }
@@ -1460,6 +1470,37 @@ mod tests {
         assert!(stdout.contains("CapPrm:\t0000000000000000"));
         assert!(stdout.contains("CapInh:\t0000000000000000"));
         assert!(stdout.contains("CapBnd:\t0000000000000000"));
+    }
+
+    #[test]
+    fn rejects_unimplemented_seccomp_profile() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [security]
+                seccomp_profile = "strict"
+            "#,
+        )
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("seccomp-unimplemented")),
+            },
+        )
+        .expect_err("run should fail");
+
+        match err {
+            SandboxError::Spawn(detail) => {
+                assert!(detail.contains("install_seccomp failed"));
+                assert!(detail.contains("not implemented yet"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     fn unique_artifact_dir(prefix: &str) -> PathBuf {

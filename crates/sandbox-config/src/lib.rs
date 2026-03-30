@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use sandbox_core::{ResourceLimits, Result, SandboxError};
+use sandbox_seccomp::SeccompProfile;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -11,6 +12,8 @@ pub struct ExecutionConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub io: IoConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
     #[serde(default)]
     pub filesystem: FilesystemConfig,
 }
@@ -116,6 +119,12 @@ pub struct IoConfig {
     pub stdout_path: Option<PathBuf>,
     pub stderr_path: Option<PathBuf>,
     pub artifact_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecurityConfig {
+    #[serde(default)]
+    pub seccomp_profile: SeccompProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,6 +368,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::ExecutionConfig;
+    use sandbox_seccomp::SeccompProfile;
 
     #[test]
     fn parses_minimal_config() {
@@ -395,6 +405,7 @@ mod tests {
 
         let config = ExecutionConfig::from_toml_str(raw).expect("config should parse");
         assert!(config.filesystem.enable_rootfs);
+        assert_eq!(config.security.seccomp_profile, SeccompProfile::Default);
         assert!(!config.filesystem.enter_user_namespace);
         assert!(!config.filesystem.enter_mount_namespace);
         assert!(!config.filesystem.enter_pid_namespace);

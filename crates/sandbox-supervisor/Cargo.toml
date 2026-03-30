@@ -10,6 +10,7 @@ libc.workspace = true
 sandbox-config = { path = "../sandbox-config" }
 sandbox-core = { path = "../sandbox-core" }
 sandbox-mount = { path = "../sandbox-mount" }
+sandbox-seccomp = { path = "../sandbox-seccomp" }
 tracing.workspace = true
 
 [dev-dependencies]

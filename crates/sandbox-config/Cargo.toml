@@ -7,6 +7,6 @@ authors.workspace = true
 
 [dependencies]
 sandbox-core = { path = "../sandbox-core" }
+sandbox-seccomp = { path = "../sandbox-seccomp" }
 serde.workspace = true
 toml.workspace = true
-
