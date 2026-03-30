@@ -1,11 +1,14 @@
 # Rust Sandbox Scaffold
 
-这个仓库现在已经按设计文档搭好了第一阶段脚手架，并打通了一条最小可运行执行链路。
+这个仓库现在已经按设计文档搭好了从最小执行链路到基础安全隔离、资源限制的一条可运行主线。
 
 ## 当前覆盖
 
 - `M0` 项目脚手架与基础设施
 - `M1` 最小执行器的核心路径
+- `M2` rootfs 与 namespace 骨架
+- `M3` cgroup v2 资源限制基础接线
+- `M4` capability drop 与 seccomp 第一版
 
 已完成能力：
 
@@ -22,14 +25,23 @@
 - `M2` rootfs scaffold：
   - 在产物目录下准备最小 rootfs 目录结构
   - 生成只读运行库、`/work`、`/tmp`、`/proc` 的挂载计划
-  - 为后续 `mount namespace` 和 `pivot_root/chroot` 接入保留生命周期入口
   - 已接入默认关闭的 `enter_mount_namespace` / `apply_mounts` / `chroot_to_rootfs` 开关
   - 已支持把可执行目录单独绑定进 rootfs，例如 `/bin`、`/usr/bin`
   - 已补环境能力探测，在不支持 namespace 的环境里会给出明确错误
   - 已接入默认关闭的 `user namespace` 开关，并在执行前完成 `no_new_privs`、bounding set 与 capability sets 降权
   - 已接入 `PID namespace` 流程，并把 `/proc` 的挂载时机延后到新的 pid 视图中
   - 已接入默认关闭的 `network namespace` / `IPC namespace` 开关与能力探测
-  - 已接入 `security.seccomp_profile = "default"` 的最小 seccomp 黑名单过滤器，并为 `strict/compat` profile 预留安装入口
+  - 已接入 `security.seccomp_profile` 的真实过滤器：`default`、`compat`、`strict`
+- `M3` cgroup v2：
+  - 已实现 cgroup v2 root 探测、scope 路径规划、目录创建与清理
+  - 已接入 `memory.max`、`memory.swap.max`、`pids.max` 写入
+  - 已在 supervisor 中接入 cgroup 创建、PID attach、usage 读取与清理
+  - 已把 `cpu.stat` / `memory.peak` 等结果回填到 `ExecutionResult.usage`
+  - 已把 `memory.events` / `memory.events.local` 中的 OOM 信号映射为 `MemoryLimitExceeded`
+- `M4` seccomp：
+  - `default` profile 会拦截高风险 syscall，例如 `mount`、`unshare`、`ptrace`、`bpf`
+  - `compat` profile 比 `default` 更宽松，保留 `ptrace`
+  - `strict` profile 在 `default` 基础上进一步阻止网络 socket 创建
 
 ## Workspace 结构
 
@@ -46,8 +58,7 @@ crates/
 └─ sandbox-testkit
 ```
 
-其中 `sandbox-cgroup`、`sandbox-mount`、`sandbox-seccomp`、`sandbox-testkit` 目前先提供了明确的模块占位和后续演进方向，便于下一阶段继续实现 `M2-M6`。
-其中 `sandbox-mount` 现在已经可以准备最小 rootfs scaffold，但还没有真正执行 `mount(2)` 和切根。
+其中 `sandbox-mount`、`sandbox-cgroup`、`sandbox-seccomp` 已经接入了第一版真实能力；`sandbox-testkit` 主要承载场景脚本与回归用例。
 
 ## 使用方式
 
@@ -63,6 +74,36 @@ cargo run -p sandbox-cli -- validate --config configs/minimal.toml
 cargo run -p sandbox-cli -- run --config configs/minimal.toml
 ```
 
+当前 `configs/minimal.toml` 默认保持“尽量容易在普通开发环境跑通”的配置：
+
+- 默认启用 `security.seccomp_profile = "default"`
+- 默认不启用 mount / pid / network / ipc / user namespace
+- 默认不启用 cgroup 限额写入
+
+如果你要开启更强隔离：
+
+- 设置 `limits.memory_bytes` 或 `limits.max_processes` 会启用 cgroup v2，要求宿主机提供可写 cgroup v2
+- 设置 `filesystem.enter_user_namespace` / `enter_mount_namespace` / `enter_pid_namespace` 等开关时，要求宿主机支持对应 namespace
+
+一个更强的配置通常至少会包含：
+
+```toml
+[limits]
+memory_bytes = 134217728
+max_processes = 32
+
+[security]
+seccomp_profile = "default"
+
+[filesystem]
+enter_user_namespace = true
+enter_mount_namespace = true
+enter_pid_namespace = true
+apply_mounts = true
+chroot_to_rootfs = true
+mount_proc = true
+```
+
 覆盖命令：
 
 ```bash
@@ -73,10 +114,10 @@ cargo run -p sandbox-cli -- run --config configs/minimal.toml --command /bin/ech
 
 优先继续做这些任务：
 
-1. `sandbox-mount` 中实现最小 rootfs、`tmpfs`、`bind mount`
-2. `sandbox-supervisor` 中接入 `unshare/clone` 与 PID/network/IPC namespace
-3. `sandbox-cgroup` 中实现 cgroup v2 路径管理与资源统计
-4. 再把统计结果回填到 `ExecutionResult`
+1. 把 cgroup v2 的 CPU 控制与更完整统计接上
+2. 继续扩 seccomp profile 与 deny-list 覆盖
+3. 补 CLI / README 中的资源超限结果展示
+4. 继续做 mount / cgroup / 子进程失败路径的清理加固
 
 ## 验证
 
