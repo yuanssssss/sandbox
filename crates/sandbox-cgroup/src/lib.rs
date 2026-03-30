@@ -34,6 +34,8 @@ pub struct CgroupUsage {
     pub memory_current_bytes: Option<u64>,
     pub memory_peak_bytes: Option<u64>,
     pub pids_current: Option<u64>,
+    pub memory_events_oom: Option<u64>,
+    pub memory_events_oom_kill: Option<u64>,
 }
 
 impl CgroupUsage {
@@ -101,6 +103,14 @@ impl CgroupManager {
             memory_current_bytes: parse_single_u64_file(&path.join("memory.current"))?,
             memory_peak_bytes: parse_single_u64_file(&path.join("memory.peak"))?,
             pids_current: parse_single_u64_file(&path.join("pids.current"))?,
+            memory_events_oom: parse_first_available_key(
+                &[path.join("memory.events.local"), path.join("memory.events")],
+                "oom",
+            )?,
+            memory_events_oom_kill: parse_first_available_key(
+                &[path.join("memory.events.local"), path.join("memory.events")],
+                "oom_kill",
+            )?,
         })
     }
 
@@ -193,6 +203,17 @@ fn parse_key_value_file(path: &Path, key: &str) -> Result<Option<u64>> {
     Ok(None)
 }
 
+fn parse_first_available_key(paths: &[PathBuf], key: &str) -> Result<Option<u64>> {
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        return parse_key_value_file(path, key);
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -257,12 +278,19 @@ mod tests {
         fs::write(path.join("memory.current"), "2048\n").expect("memory.current should exist");
         fs::write(path.join("memory.peak"), "8192\n").expect("memory.peak should exist");
         fs::write(path.join("pids.current"), "3\n").expect("pids.current should exist");
+        fs::write(
+            path.join("memory.events"),
+            "low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\n",
+        )
+        .expect("memory.events should exist");
 
         let usage = manager.read_usage(&plan).expect("usage should read");
         assert_eq!(usage.cpu_time_usec, Some(12_345));
         assert_eq!(usage.memory_current_bytes, Some(2_048));
         assert_eq!(usage.memory_peak_bytes, Some(8_192));
         assert_eq!(usage.pids_current, Some(3));
+        assert_eq!(usage.memory_events_oom, Some(1));
+        assert_eq!(usage.memory_events_oom_kill, Some(1));
         assert_eq!(
             fs::read_to_string(path.join("cgroup.procs")).expect("cgroup.procs should exist"),
             "4242\n"

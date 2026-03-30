@@ -217,10 +217,23 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
     let wall_limit = Duration::from_millis(config.limits.wall_time_ms);
     let wait_outcome = wait_for_exit(&mut child, wall_limit)?;
 
-    let status = classify_status(wait_outcome.timed_out, &wait_outcome.exit_status);
+    let finalized_cgroup = finalize_cgroup(cgroup_binding.as_ref(), wait_outcome.elapsed)?;
+    let status = classify_status(
+        wait_outcome.timed_out,
+        &wait_outcome.exit_status,
+        finalized_cgroup
+            .as_ref()
+            .is_some_and(|value| value.memory_limit_exceeded),
+    );
     let term_signal = wait_outcome.exit_status.signal();
     let exit_code = wait_outcome.exit_status.code();
-    let usage = finalize_resource_usage(cgroup_binding.as_ref(), wait_outcome.elapsed)?;
+    let usage = finalized_cgroup
+        .map(|value| value.usage)
+        .unwrap_or_else(|| ResourceUsage {
+            cpu_time_ms: None,
+            wall_time_ms: wait_outcome.elapsed.as_millis() as u64,
+            memory_peak_bytes: None,
+        });
 
     Ok(ExecutionResult {
         command,
@@ -237,6 +250,12 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
 struct CgroupBinding {
     manager: CgroupManager,
     plan: CgroupPlan,
+}
+
+#[derive(Debug, Clone)]
+struct FinalizedCgroup {
+    usage: ResourceUsage,
+    memory_limit_exceeded: bool,
 }
 
 fn prepare_cgroup_context(
@@ -277,27 +296,26 @@ fn cgroup_scope_name(artifact_dir: &Path) -> String {
         })
 }
 
-fn finalize_resource_usage(
+fn finalize_cgroup(
     cgroup_binding: Option<&CgroupBinding>,
     elapsed: Duration,
-) -> Result<ResourceUsage> {
+) -> Result<Option<FinalizedCgroup>> {
     let wall_time_ms = elapsed.as_millis() as u64;
-    let mut usage = ResourceUsage {
-        cpu_time_ms: None,
-        wall_time_ms,
-        memory_peak_bytes: None,
-    };
-
     let Some(binding) = cgroup_binding else {
-        return Ok(usage);
+        return Ok(None);
     };
 
     let stats = binding.manager.read_usage(&binding.plan);
     let cleanup_result = binding.manager.cleanup(&binding.plan);
     let stats = stats?;
     cleanup_result?;
-    usage = stats.into_resource_usage(wall_time_ms);
-    Ok(usage)
+    let memory_limit_exceeded =
+        stats.memory_events_oom.unwrap_or(0) > 0 || stats.memory_events_oom_kill.unwrap_or(0) > 0;
+    let usage = stats.into_resource_usage(wall_time_ms);
+    Ok(Some(FinalizedCgroup {
+        usage,
+        memory_limit_exceeded,
+    }))
 }
 
 fn rootfs_cwd(config: &ExecutionConfig) -> Option<PathBuf> {
@@ -873,9 +891,15 @@ fn send_signal_to_group(pid: i32, signal: i32) {
     }
 }
 
-fn classify_status(timed_out: bool, exit_status: &ExitStatus) -> ExecutionStatus {
+fn classify_status(
+    timed_out: bool,
+    exit_status: &ExitStatus,
+    memory_limit_exceeded: bool,
+) -> ExecutionStatus {
     if timed_out {
         ExecutionStatus::WallTimeLimitExceeded
+    } else if memory_limit_exceeded {
+        ExecutionStatus::MemoryLimitExceeded
     } else if exit_status.success() {
         ExecutionStatus::Ok
     } else {
@@ -1757,6 +1781,48 @@ mod tests {
     }
 
     #[test]
+    fn maps_memory_events_to_memory_limit_exceeded_status() {
+        let artifact_dir = unique_artifact_dir("cgroup-memory-status");
+        let cgroup_root = unique_artifact_dir("cgroup-memory-root");
+        fs::create_dir_all(&cgroup_root).expect("cgroup root should exist");
+        fs::write(cgroup_root.join("cgroup.controllers"), "memory pids cpu\n")
+            .expect("controllers should exist");
+        let cgroup_dir = cgroup_root.join(cgroup_scope_name(&artifact_dir));
+
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "printf 'usage_usec 12000\n' > {cpu_stat}; printf '8192\n' > {memory_current}; printf '32768\n' > {memory_peak}; printf '0\n' > {pids_current}; printf 'low 0\nhigh 0\nmax 1\noom 1\noom_kill 1\n' > {memory_events}; exit 137"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 32768
+            "#,
+            cpu_stat = shell_single_quote(&cgroup_dir.join("cpu.stat")),
+            memory_current = shell_single_quote(&cgroup_dir.join("memory.current")),
+            memory_peak = shell_single_quote(&cgroup_dir.join("memory.peak")),
+            pids_current = shell_single_quote(&cgroup_dir.join("pids.current")),
+            memory_events = shell_single_quote(&cgroup_dir.join("memory.events")),
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+                cgroup_root_override: Some(cgroup_root),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::MemoryLimitExceeded);
+        assert_eq!(result.exit_code, Some(137));
+        assert_eq!(result.usage.cpu_time_ms, Some(12));
+        assert_eq!(result.usage.memory_peak_bytes, Some(32_768));
+    }
+
+    #[test]
     #[ignore = "requires writable cgroup v2 support in the test environment"]
     fn enforces_pids_max_against_fork_attempts() {
         if !supports_writable_cgroup_v2() {
@@ -1822,6 +1888,39 @@ mod tests {
         assert_eq!(result.status, ExecutionStatus::Ok);
         let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
         assert_eq!(stdout.trim(), "True");
+    }
+
+    #[test]
+    #[ignore = "requires writable cgroup v2 support in the test environment"]
+    fn maps_real_memory_max_oom_to_memory_limit_exceeded() {
+        if !supports_writable_cgroup_v2() {
+            return;
+        }
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/usr/bin/python3", "-c", "chunks = []; chunk = b'x' * (1024 * 1024); exec(\"while True:\\n chunks.append(chunk[:])\")"]
+
+                [limits]
+                wall_time_ms = 3000
+                memory_bytes = 8388608
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("cgroup-memory-oom")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::MemoryLimitExceeded);
+        assert!(result.usage.memory_peak_bytes.is_some());
     }
 
     fn unique_artifact_dir(prefix: &str) -> PathBuf {
