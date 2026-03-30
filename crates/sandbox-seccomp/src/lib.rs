@@ -166,7 +166,22 @@ fn default_denied_syscalls() -> &'static [i64] {
 }
 
 fn compat_denied_syscalls() -> &'static [i64] {
-    default_denied_syscalls()
+    &[
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_keyctl,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_kexec_load,
+    ]
 }
 
 pub fn roadmap() -> &'static str {
@@ -187,14 +202,7 @@ mod tests {
                 return 1;
             }
 
-            let ptrace_result = unsafe {
-                libc::ptrace(
-                    libc::PTRACE_TRACEME,
-                    0,
-                    std::ptr::null_mut::<libc::c_void>(),
-                    0,
-                )
-            };
+            let ptrace_result = ptrace_traceme();
             if ptrace_result != -1 {
                 return 2;
             }
@@ -211,9 +219,41 @@ mod tests {
     }
 
     #[test]
+    fn compat_filter_keeps_ptrace_available() {
+        let status = run_in_child(|| {
+            install(SeccompProfile::Compat).expect("compat seccomp should install");
+
+            let pid = unsafe { libc::getpid() };
+            if pid <= 0 {
+                return 1;
+            }
+
+            let ptrace_result = ptrace_traceme();
+            if ptrace_result != 0 {
+                return 2;
+            }
+
+            0
+        });
+
+        assert_eq!(status, 0, "compat filter should keep ptrace available");
+    }
+
+    #[test]
     fn strict_profile_is_still_unimplemented() {
         let err = install(SeccompProfile::Strict).expect_err("strict should remain unimplemented");
         assert!(err.to_string().contains("not implemented"));
+    }
+
+    fn ptrace_traceme() -> libc::c_long {
+        unsafe {
+            libc::ptrace(
+                libc::PTRACE_TRACEME,
+                0,
+                std::ptr::null_mut::<libc::c_void>(),
+                0,
+            )
+        }
     }
 
     fn run_in_child(f: impl FnOnce() -> i32) -> i32 {
