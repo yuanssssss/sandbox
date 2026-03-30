@@ -123,6 +123,8 @@ pub struct FilesystemConfig {
     #[serde(default = "default_rootfs_enabled")]
     pub enable_rootfs: bool,
     pub rootfs_dir: Option<PathBuf>,
+    #[serde(default = "default_enter_user_namespace")]
+    pub enter_user_namespace: bool,
     #[serde(default = "default_enter_mount_namespace")]
     pub enter_mount_namespace: bool,
     #[serde(default = "default_enter_pid_namespace")]
@@ -152,6 +154,7 @@ impl Default for FilesystemConfig {
         Self {
             enable_rootfs: default_rootfs_enabled(),
             rootfs_dir: None,
+            enter_user_namespace: default_enter_user_namespace(),
             enter_mount_namespace: default_enter_mount_namespace(),
             enter_pid_namespace: default_enter_pid_namespace(),
             enter_network_namespace: default_enter_network_namespace(),
@@ -175,6 +178,11 @@ impl FilesystemConfig {
         if self.apply_mounts && !self.enter_mount_namespace {
             return Err(SandboxError::config(
                 "filesystem.apply_mounts requires filesystem.enter_mount_namespace = true",
+            ));
+        }
+        if self.enter_mount_namespace && !self.enter_user_namespace {
+            return Err(SandboxError::config(
+                "filesystem.enter_mount_namespace requires filesystem.enter_user_namespace = true",
             ));
         }
         if self.enter_pid_namespace && !self.enter_mount_namespace {
@@ -259,6 +267,10 @@ const fn default_enter_mount_namespace() -> bool {
     false
 }
 
+const fn default_enter_user_namespace() -> bool {
+    false
+}
+
 const fn default_enter_pid_namespace() -> bool {
     false
 }
@@ -340,6 +352,7 @@ mod tests {
 
         let config = ExecutionConfig::from_toml_str(raw).expect("config should parse");
         assert!(config.filesystem.enable_rootfs);
+        assert!(!config.filesystem.enter_user_namespace);
         assert!(!config.filesystem.enter_mount_namespace);
         assert!(!config.filesystem.enter_pid_namespace);
         assert!(!config.filesystem.enter_network_namespace);
@@ -396,6 +409,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mount_namespace_without_user_namespace() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            enter_mount_namespace = true
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("enter_user_namespace"));
+    }
+
+    #[test]
     fn rejects_pid_namespace_without_mount_namespace() {
         let raw = r#"
             [process]
@@ -444,6 +471,7 @@ mod tests {
             argv = ["/bin/echo", "hello"]
 
             [filesystem]
+            enter_user_namespace = true
             enter_mount_namespace = true
             chroot_to_rootfs = true
         "#;

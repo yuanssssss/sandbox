@@ -8,6 +8,7 @@ pub enum Scenario {
     ProcVisibilityProbe,
     NetworkIsolationProbe,
     IpcIsolationProbe,
+    UserNamespaceProbe,
 }
 
 impl Scenario {
@@ -21,6 +22,7 @@ impl Scenario {
             Self::ProcVisibilityProbe => "test -d /proc && test -r /proc/self/status",
             Self::NetworkIsolationProbe => "test ! -e /proc/net/dev",
             Self::IpcIsolationProbe => "test -w /proc/sysvipc || test ! -e /proc/sysvipc",
+            Self::UserNamespaceProbe => "id -u && id -g",
         }
     }
 }

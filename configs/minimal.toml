@@ -15,6 +15,7 @@ artifact_dir = ".sandbox-runs/example"
 
 [filesystem]
 enable_rootfs = true
+enter_user_namespace = false
 enter_mount_namespace = false
 enter_pid_namespace = false
 enter_network_namespace = false

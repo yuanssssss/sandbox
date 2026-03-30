@@ -9,6 +9,8 @@ pub enum SandboxError {
         capability: &'static str,
         detail: String,
     },
+    #[error("permission isolation setup failed: {0}")]
+    Permission(String),
     #[error("I/O error while {context}: {source}")]
     Io {
         context: &'static str,
@@ -37,6 +39,10 @@ impl SandboxError {
             capability,
             detail: detail.into(),
         }
+    }
+
+    pub fn permission(message: impl Into<String>) -> Self {
+        Self::Permission(message.into())
     }
 
     pub fn io(context: &'static str, source: std::io::Error) -> Self {

@@ -98,6 +98,10 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
+            if filesystem.enter_user_namespace {
+                enter_user_namespace()?;
+                drop_capabilities()?;
+            }
             if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
                 enter_optional_namespaces(&filesystem)?;
                 let runtime = setup_rootfs(&filesystem, &artifact_dir, rootfs_cwd.as_deref())
@@ -165,6 +169,14 @@ fn rootfs_cwd(config: &ExecutionConfig) -> Option<PathBuf> {
 
 fn ensure_namespace_support(config: &ExecutionConfig) -> Result<()> {
     let support = probe_namespace_support();
+    if config.filesystem.enter_user_namespace && !support.user_namespace {
+        return Err(SandboxError::capability_unavailable(
+            "user_namespace",
+            support
+                .user_reason
+                .unwrap_or_else(|| "unknown user namespace error".to_string()),
+        ));
+    }
     if config.filesystem.enter_mount_namespace && !support.mount_namespace {
         return Err(SandboxError::capability_unavailable(
             "mount_namespace",
@@ -203,6 +215,8 @@ fn ensure_namespace_support(config: &ExecutionConfig) -> Result<()> {
 
 #[derive(Debug, Clone, Default)]
 struct NamespaceSupport {
+    user_namespace: bool,
+    user_reason: Option<String>,
     mount_namespace: bool,
     mount_reason: Option<String>,
     pid_namespace: bool,
@@ -214,12 +228,15 @@ struct NamespaceSupport {
 }
 
 fn probe_namespace_support() -> NamespaceSupport {
+    let user_probe = probe_unshare_support(libc::CLONE_NEWUSER);
     let mount_probe = probe_unshare_support(libc::CLONE_NEWNS);
     let pid_probe = probe_unshare_support(libc::CLONE_NEWPID);
     let network_probe = probe_unshare_support(libc::CLONE_NEWNET);
     let ipc_probe = probe_unshare_support(libc::CLONE_NEWIPC);
 
     NamespaceSupport {
+        user_namespace: user_probe.is_ok(),
+        user_reason: user_probe.err(),
         mount_namespace: mount_probe.is_ok(),
         mount_reason: mount_probe.err(),
         pid_namespace: pid_probe.is_ok(),
@@ -342,12 +359,34 @@ fn waitpid_status(pid: libc::pid_t) -> std::result::Result<libc::c_int, String> 
 
 fn namespace_name(flag: libc::c_int) -> &'static str {
     match flag {
+        libc::CLONE_NEWUSER => "user namespace probe",
         libc::CLONE_NEWNS => "mount namespace probe",
         libc::CLONE_NEWPID => "pid namespace probe",
         libc::CLONE_NEWNET => "network namespace probe",
         libc::CLONE_NEWIPC => "ipc namespace probe",
         _ => "namespace probe",
     }
+}
+
+fn enter_user_namespace() -> std::io::Result<()> {
+    let result = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn drop_capabilities() -> std::io::Result<()> {
+    let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if result == -1 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINVAL) {
+            return Err(err);
+        }
+    }
+
+    Ok(())
 }
 
 fn enter_optional_namespaces(filesystem: &sandbox_config::FilesystemConfig) -> std::io::Result<()> {
@@ -636,6 +675,7 @@ mod tests {
 
                 [filesystem]
                 enable_rootfs = true
+                enter_user_namespace = true
                 enter_mount_namespace = true
                 apply_mounts = true
                 chroot_to_rootfs = true
@@ -662,6 +702,7 @@ mod tests {
 
                 [filesystem]
                 enable_rootfs = true
+                enter_user_namespace = true
                 enter_mount_namespace = true
             "#,
         )
@@ -679,6 +720,42 @@ mod tests {
         match err {
             SandboxError::CapabilityUnavailable { capability, .. } => {
                 assert_eq!(capability, "mount_namespace");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn reports_capability_error_when_user_namespace_is_unavailable() {
+        let support = probe_namespace_support();
+        if support.user_namespace {
+            return;
+        }
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [filesystem]
+                enable_rootfs = true
+                enter_user_namespace = true
+            "#,
+        )
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("unsupported-user")),
+            },
+        )
+        .expect_err("run should fail");
+
+        match err {
+            SandboxError::CapabilityUnavailable { capability, .. } => {
+                assert_eq!(capability, "user_namespace");
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -762,7 +839,7 @@ mod tests {
     #[ignore = "requires mount namespace and chroot privileges in the test environment"]
     fn can_write_inside_sandbox_workdir_when_mounts_are_enabled() {
         let support = probe_namespace_support();
-        if !support.mount_namespace || !support.pid_namespace {
+        if !support.user_namespace || !support.mount_namespace || !support.pid_namespace {
             return;
         }
         let artifact_dir = unique_artifact_dir("workdir-probe");
@@ -776,6 +853,7 @@ mod tests {
 
                 [filesystem]
                 enable_rootfs = true
+                enter_user_namespace = true
                 enter_mount_namespace = true
                 enter_pid_namespace = true
                 apply_mounts = true
@@ -805,7 +883,7 @@ mod tests {
     #[ignore = "requires mount namespace and chroot privileges in the test environment"]
     fn hides_host_file_after_chroot() {
         let support = probe_namespace_support();
-        if !support.mount_namespace || !support.pid_namespace {
+        if !support.user_namespace || !support.mount_namespace || !support.pid_namespace {
             return;
         }
         let artifact_dir = unique_artifact_dir("host-visibility");
@@ -822,6 +900,7 @@ mod tests {
 
                 [filesystem]
                 enable_rootfs = true
+                enter_user_namespace = true
                 enter_mount_namespace = true
                 enter_pid_namespace = true
                 apply_mounts = true
@@ -850,7 +929,7 @@ mod tests {
     #[ignore = "requires mount namespace and chroot privileges in the test environment"]
     fn mounts_minimal_proc_inside_rootfs() {
         let support = probe_namespace_support();
-        if !support.mount_namespace || !support.pid_namespace {
+        if !support.user_namespace || !support.mount_namespace || !support.pid_namespace {
             return;
         }
         let artifact_dir = unique_artifact_dir("proc-visibility");
@@ -864,6 +943,7 @@ mod tests {
 
                 [filesystem]
                 enable_rootfs = true
+                enter_user_namespace = true
                 enter_mount_namespace = true
                 enter_pid_namespace = true
                 apply_mounts = true
@@ -893,7 +973,11 @@ mod tests {
     #[ignore = "requires mount, pid, network, and chroot privileges in the test environment"]
     fn isolates_network_namespace_view() {
         let support = probe_namespace_support();
-        if !support.mount_namespace || !support.pid_namespace || !support.network_namespace {
+        if !support.user_namespace
+            || !support.mount_namespace
+            || !support.pid_namespace
+            || !support.network_namespace
+        {
             return;
         }
         let artifact_dir = unique_artifact_dir("network-isolation");
@@ -907,6 +991,7 @@ mod tests {
 
                 [filesystem]
                 enable_rootfs = true
+                enter_user_namespace = true
                 enter_mount_namespace = true
                 enter_pid_namespace = true
                 enter_network_namespace = true
@@ -937,7 +1022,11 @@ mod tests {
     #[ignore = "requires mount, pid, ipc, and chroot privileges in the test environment"]
     fn isolates_ipc_namespace_view() {
         let support = probe_namespace_support();
-        if !support.mount_namespace || !support.pid_namespace || !support.ipc_namespace {
+        if !support.user_namespace
+            || !support.mount_namespace
+            || !support.pid_namespace
+            || !support.ipc_namespace
+        {
             return;
         }
         let artifact_dir = unique_artifact_dir("ipc-isolation");
@@ -951,6 +1040,7 @@ mod tests {
 
                 [filesystem]
                 enable_rootfs = true
+                enter_user_namespace = true
                 enter_mount_namespace = true
                 enter_pid_namespace = true
                 enter_ipc_namespace = true
@@ -963,6 +1053,42 @@ mod tests {
             "#,
             script = Scenario::IpcIsolationProbe.shell_snippet()
         ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+    }
+
+    #[test]
+    #[ignore = "requires user namespace support in the test environment"]
+    fn enters_user_namespace_before_running_payload() {
+        let support = probe_namespace_support();
+        if !support.user_namespace {
+            return;
+        }
+
+        let artifact_dir = unique_artifact_dir("userns");
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/usr/bin/id", "-u"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_user_namespace = true
+            "#,
+        )
         .expect("config should parse");
 
         let result = run(
