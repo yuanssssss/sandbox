@@ -6,5 +6,5 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+sandbox-config = { path = "../sandbox-config" }
 sandbox-core = { path = "../sandbox-core" }
-

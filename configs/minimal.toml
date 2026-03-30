@@ -13,3 +13,7 @@ max_processes = 32
 [io]
 artifact_dir = ".sandbox-runs/example"
 
+[filesystem]
+enable_rootfs = true
+work_dir = "/work"
+tmp_dir = "/tmp"

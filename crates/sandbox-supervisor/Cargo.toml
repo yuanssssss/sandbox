@@ -9,5 +9,5 @@ authors.workspace = true
 libc.workspace = true
 sandbox-config = { path = "../sandbox-config" }
 sandbox-core = { path = "../sandbox-core" }
+sandbox-mount = { path = "../sandbox-mount" }
 tracing.workspace = true
-

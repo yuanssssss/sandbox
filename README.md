@@ -19,6 +19,10 @@
   - 输出重定向到产物目录
   - wall-clock 超时
   - 按进程组发送 `SIGTERM` / `SIGKILL` 回收
+- `M2` rootfs scaffold：
+  - 在产物目录下准备最小 rootfs 目录结构
+  - 生成只读运行库、`/work`、`/tmp`、`/proc` 的挂载计划
+  - 为后续 `mount namespace` 和 `pivot_root/chroot` 接入保留生命周期入口
 
 ## Workspace 结构
 
@@ -36,6 +40,7 @@ crates/
 ```
 
 其中 `sandbox-cgroup`、`sandbox-mount`、`sandbox-seccomp`、`sandbox-testkit` 目前先提供了明确的模块占位和后续演进方向，便于下一阶段继续实现 `M2-M6`。
+其中 `sandbox-mount` 现在已经可以准备最小 rootfs scaffold，但还没有真正执行 `mount(2)` 和切根。
 
 ## 使用方式
 

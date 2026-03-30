@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandbox_config::ExecutionConfig;
 use sandbox_core::{ExecutionResult, ExecutionStatus, ResourceUsage, Result, SandboxError};
+use sandbox_mount::prepare_rootfs;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default)]
@@ -39,6 +40,15 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
         .unwrap_or_else(default_artifact_dir);
     fs::create_dir_all(&artifact_dir)
         .map_err(|err| SandboxError::io("creating artifact directory", err))?;
+
+    if config.filesystem.enable_rootfs {
+        let rootfs_plan = prepare_rootfs(&config.filesystem, &artifact_dir)?;
+        info!(
+            root = %rootfs_plan.layout.root.display(),
+            mounts = rootfs_plan.mount_count(),
+            "prepared rootfs scaffold"
+        );
+    }
 
     let stdout_path = resolve_output_path(
         &artifact_dir,
@@ -276,6 +286,40 @@ mod tests {
         .expect("command should run");
 
         assert_eq!(result.status, ExecutionStatus::WallTimeLimitExceeded);
+    }
+
+    #[test]
+    fn prepares_rootfs_scaffold_before_execution() {
+        let artifact_dir = unique_artifact_dir("rootfs");
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir.clone()),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        assert!(artifact_dir.join("rootfs").exists());
+        assert!(artifact_dir.join("rootfs/work").exists());
+        assert!(artifact_dir.join("rootfs/tmp").exists());
+        assert!(artifact_dir.join("rootfs/proc").exists());
+        assert!(artifact_dir.join("work").exists());
     }
 
     fn unique_artifact_dir(prefix: &str) -> PathBuf {

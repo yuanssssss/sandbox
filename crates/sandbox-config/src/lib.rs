@@ -11,6 +11,8 @@ pub struct ExecutionConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub io: IoConfig,
+    #[serde(default)]
+    pub filesystem: FilesystemConfig,
 }
 
 impl ExecutionConfig {
@@ -55,6 +57,7 @@ impl ExecutionConfig {
         for entry in &self.process.env {
             parse_env_entry(entry)?;
         }
+        self.filesystem.validate()?;
 
         Ok(())
     }
@@ -115,6 +118,64 @@ pub struct IoConfig {
     pub artifact_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesystemConfig {
+    #[serde(default = "default_rootfs_enabled")]
+    pub enable_rootfs: bool,
+    pub rootfs_dir: Option<PathBuf>,
+    #[serde(default = "default_work_dir")]
+    pub work_dir: PathBuf,
+    #[serde(default = "default_tmp_dir")]
+    pub tmp_dir: PathBuf,
+    #[serde(default = "default_runtime_bind_paths")]
+    pub runtime_bind_paths: Vec<PathBuf>,
+    #[serde(default = "default_mount_proc")]
+    pub mount_proc: bool,
+}
+
+impl Default for FilesystemConfig {
+    fn default() -> Self {
+        Self {
+            enable_rootfs: default_rootfs_enabled(),
+            rootfs_dir: None,
+            work_dir: default_work_dir(),
+            tmp_dir: default_tmp_dir(),
+            runtime_bind_paths: default_runtime_bind_paths(),
+            mount_proc: default_mount_proc(),
+        }
+    }
+}
+
+impl FilesystemConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !self.enable_rootfs {
+            return Ok(());
+        }
+
+        if !self.work_dir.is_absolute() {
+            return Err(SandboxError::config(
+                "filesystem.work_dir must be an absolute path",
+            ));
+        }
+        if !self.tmp_dir.is_absolute() {
+            return Err(SandboxError::config(
+                "filesystem.tmp_dir must be an absolute path",
+            ));
+        }
+
+        for path in &self.runtime_bind_paths {
+            if !path.is_absolute() {
+                return Err(SandboxError::config(format!(
+                    "filesystem.runtime_bind_paths must contain absolute paths: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 pub fn parse_env_entry(entry: &str) -> Result<(String, String)> {
     let (key, value) = entry
         .split_once('=')
@@ -135,8 +196,34 @@ const fn default_wall_time_ms() -> u64 {
     3_000
 }
 
+const fn default_rootfs_enabled() -> bool {
+    true
+}
+
+fn default_work_dir() -> PathBuf {
+    PathBuf::from("/work")
+}
+
+fn default_tmp_dir() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+fn default_runtime_bind_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+        PathBuf::from("/usr/lib"),
+    ]
+}
+
+const fn default_mount_proc() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::ExecutionConfig;
 
     #[test]
@@ -163,5 +250,34 @@ mod tests {
 
         let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
         assert!(err.to_string().contains("process.argv"));
+    }
+
+    #[test]
+    fn applies_filesystem_defaults() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+        "#;
+
+        let config = ExecutionConfig::from_toml_str(raw).expect("config should parse");
+        assert!(config.filesystem.enable_rootfs);
+        assert_eq!(config.filesystem.work_dir, PathBuf::from("/work"));
+        assert_eq!(config.filesystem.tmp_dir, PathBuf::from("/tmp"));
+        assert!(config.filesystem.mount_proc);
+        assert_eq!(config.filesystem.runtime_bind_paths.len(), 3);
+    }
+
+    #[test]
+    fn rejects_relative_runtime_bind_path() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            runtime_bind_paths = ["usr/lib"]
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("runtime_bind_paths"));
     }
 }
