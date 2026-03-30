@@ -29,6 +29,7 @@
   - 已接入默认关闭的 `user namespace` 开关，并在执行前完成 `no_new_privs`、bounding set 与 capability sets 降权
   - 已接入 `PID namespace` 流程，并把 `/proc` 的挂载时机延后到新的 pid 视图中
   - 已接入默认关闭的 `network namespace` / `IPC namespace` 开关与能力探测
+  - 已接入 `security.seccomp_profile = "default"` 的最小 seccomp 黑名单过滤器，并为 `strict/compat` profile 预留安装入口
 
 ## Workspace 结构
 

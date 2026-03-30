@@ -1503,6 +1503,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn installs_default_seccomp_filter() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "grep '^Seccomp:' /proc/self/status && grep '^NoNewPrivs:' /proc/self/status"]
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("seccomp-default")),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert!(stdout.contains("Seccomp:\t2"));
+        assert!(stdout.contains("NoNewPrivs:\t1"));
+    }
+
     fn unique_artifact_dir(prefix: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
