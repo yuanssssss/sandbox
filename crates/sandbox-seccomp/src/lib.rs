@@ -172,3 +172,63 @@ fn compat_denied_syscalls() -> &'static [i64] {
 pub fn roadmap() -> &'static str {
     "M4 scaffold: model seccomp profiles and install syscall filters as defense in depth."
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{SeccompProfile, install};
+
+    #[test]
+    fn default_filter_allows_basic_syscalls_and_blocks_ptrace() {
+        let status = run_in_child(|| {
+            install(SeccompProfile::Default).expect("default seccomp should install");
+
+            let pid = unsafe { libc::getpid() };
+            if pid <= 0 {
+                return 1;
+            }
+
+            let ptrace_result = unsafe {
+                libc::ptrace(
+                    libc::PTRACE_TRACEME,
+                    0,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    0,
+                )
+            };
+            if ptrace_result != -1 {
+                return 2;
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EPERM) {
+                return 3;
+            }
+
+            0
+        });
+
+        assert_eq!(status, 0, "child should exit successfully");
+    }
+
+    #[test]
+    fn strict_profile_is_still_unimplemented() {
+        let err = install(SeccompProfile::Strict).expect_err("strict should remain unimplemented");
+        assert!(err.to_string().contains("not implemented"));
+    }
+
+    fn run_in_child(f: impl FnOnce() -> i32) -> i32 {
+        let pid = unsafe { libc::fork() };
+        assert_ne!(pid, -1, "fork should succeed");
+
+        if pid == 0 {
+            let code = f();
+            unsafe { libc::_exit(code) }
+        }
+
+        let mut status = 0;
+        let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(wait_result, pid, "waitpid should succeed");
+        assert!(libc::WIFEXITED(status), "child should exit normally");
+        libc::WEXITSTATUS(status)
+    }
+}
