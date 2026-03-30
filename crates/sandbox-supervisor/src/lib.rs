@@ -7,7 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandbox_config::ExecutionConfig;
 use sandbox_core::{ExecutionResult, ExecutionStatus, ResourceUsage, Result, SandboxError};
-use sandbox_mount::{RootfsPlan, mount_proc_in_rootfs, prepare_rootfs, setup_rootfs};
+use sandbox_mount::{
+    RootfsPlan, apply_rootfs, chroot_into_rootfs, enter_mount_namespace, mount_proc_in_rootfs,
+    prepare_rootfs,
+};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default)]
@@ -117,20 +120,57 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
                 })?;
             }
             if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
-                enter_optional_namespaces(&filesystem)?;
-                let runtime = setup_rootfs(&filesystem, &artifact_dir, rootfs_cwd.as_deref())
-                    .map_err(|err| {
+                enter_optional_namespaces(&filesystem).map_err(|err| {
+                    let _ = fs::write(
+                        artifact_dir.join("rootfs-preexec-error.log"),
+                        format!("enter_optional_namespaces failed: {err}"),
+                    );
+                    err
+                })?;
+                let plan = prepare_rootfs(&filesystem, &artifact_dir).map_err(|err| {
+                    let _ = fs::write(
+                        artifact_dir.join("rootfs-preexec-error.log"),
+                        err.to_string(),
+                    );
+                    std::io::Error::other(err)
+                })?;
+                enter_mount_namespace().map_err(|err| {
+                    let _ = fs::write(
+                        artifact_dir.join("rootfs-preexec-error.log"),
+                        err.to_string(),
+                    );
+                    std::io::Error::other(err)
+                })?;
+                if filesystem.apply_mounts {
+                    apply_rootfs(&plan, !filesystem.enter_pid_namespace).map_err(|err| {
                         let _ = fs::write(
                             artifact_dir.join("rootfs-preexec-error.log"),
                             err.to_string(),
                         );
                         std::io::Error::other(err)
                     })?;
+                }
                 if filesystem.enter_pid_namespace {
                     enter_pid_namespace_for_exec(
-                        filesystem.mount_proc.then_some(&runtime.plan),
+                        filesystem.mount_proc.then_some(&plan),
                         &artifact_dir,
-                    )?;
+                    )
+                    .map_err(|err| {
+                        let _ = fs::write(
+                            artifact_dir.join("rootfs-preexec-error.log"),
+                            format!("enter_pid_namespace_for_exec failed: {err}"),
+                        );
+                        err
+                    })?;
+                }
+                if filesystem.chroot_to_rootfs {
+                    chroot_into_rootfs(&plan, rootfs_cwd.as_deref()).map_err(|err| {
+                        let _ = fs::write(
+                            artifact_dir.join("rootfs-preexec-error.log"),
+                            err.to_string(),
+                        );
+                        std::io::Error::other(err)
+                    })?;
                 }
             }
             Ok(())
