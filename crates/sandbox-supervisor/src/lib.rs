@@ -1473,11 +1473,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unimplemented_seccomp_profile() {
+    fn strict_seccomp_profile_blocks_socket_creation() {
         let config = ExecutionConfig::from_toml_str(
             r#"
                 [process]
-                argv = ["/bin/echo", "hello"]
+                argv = ["/usr/bin/python3", "-c", "import socket; import sys; exec(\"try:\\n socket.socket(socket.AF_INET, socket.SOCK_STREAM)\\n raise SystemExit(1)\\nexcept OSError as err:\\n print(err.errno)\\n raise SystemExit(0 if err.errno == 1 else 2)\")"]
 
                 [security]
                 seccomp_profile = "strict"
@@ -1485,22 +1485,18 @@ mod tests {
         )
         .expect("config should parse");
 
-        let err = run(
+        let result = run(
             &config,
             &RunOptions {
                 argv_override: None,
-                artifact_dir: Some(unique_artifact_dir("seccomp-unimplemented")),
+                artifact_dir: Some(unique_artifact_dir("seccomp-strict-socket")),
             },
         )
-        .expect_err("run should fail");
+        .expect("command should run");
 
-        match err {
-            SandboxError::Spawn(detail) => {
-                assert!(detail.contains("install_seccomp failed"));
-                assert!(detail.contains("not implemented yet"));
-            }
-            other => panic!("unexpected error: {other}"),
-        }
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "1");
     }
 
     #[test]

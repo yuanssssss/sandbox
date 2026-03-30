@@ -29,7 +29,7 @@ pub fn install(profile: SeccompProfile) -> Result<(), SeccompError> {
     match profile {
         SeccompProfile::Default => install_blacklist_filter(default_denied_syscalls()),
         SeccompProfile::Compat => install_blacklist_filter(compat_denied_syscalls()),
-        SeccompProfile::Strict => Err(SeccompError::UnimplementedProfile("strict")),
+        SeccompProfile::Strict => install_blacklist_filter(strict_denied_syscalls()),
     }
 }
 
@@ -184,6 +184,39 @@ fn compat_denied_syscalls() -> &'static [i64] {
     ]
 }
 
+fn strict_denied_syscalls() -> &'static [i64] {
+    &[
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_ptrace,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_add_key,
+        libc::SYS_request_key,
+        libc::SYS_keyctl,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_kexec_load,
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_connect,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+        libc::SYS_sendto,
+        libc::SYS_sendmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_recvfrom,
+        libc::SYS_recvmsg,
+        libc::SYS_recvmmsg,
+    ]
+}
+
 pub fn roadmap() -> &'static str {
     "M4 scaffold: model seccomp profiles and install syscall filters as defense in depth."
 }
@@ -240,9 +273,24 @@ mod tests {
     }
 
     #[test]
-    fn strict_profile_is_still_unimplemented() {
-        let err = install(SeccompProfile::Strict).expect_err("strict should remain unimplemented");
-        assert!(err.to_string().contains("not implemented"));
+    fn strict_filter_blocks_socket_creation() {
+        let status = run_in_child(|| {
+            install(SeccompProfile::Strict).expect("strict seccomp should install");
+
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if fd != -1 {
+                return 1;
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EPERM) {
+                return 2;
+            }
+
+            0
+        });
+
+        assert_eq!(status, 0, "strict filter should block socket creation");
     }
 
     fn ptrace_traceme() -> libc::c_long {
