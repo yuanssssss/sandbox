@@ -1528,6 +1528,61 @@ mod tests {
         assert!(stdout.contains("NoNewPrivs:\t1"));
     }
 
+    #[test]
+    fn default_seccomp_profile_blocks_ptrace_in_supervisor_flow() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/usr/bin/python3", "-c", "import ctypes, os; libc = ctypes.CDLL(None, use_errno=True); result = libc.ptrace(0, 0, None, 0); err = ctypes.get_errno(); print(result); print(err); raise SystemExit(0 if result == -1 and err == 1 else 1)"]
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("seccomp-default-ptrace")),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("-1"));
+        assert_eq!(lines.next(), Some("1"));
+    }
+
+    #[test]
+    fn compat_seccomp_profile_allows_ptrace_in_supervisor_flow() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/usr/bin/python3", "-c", "import ctypes; libc = ctypes.CDLL(None, use_errno=True); result = libc.ptrace(0, 0, None, 0); err = ctypes.get_errno(); print(result); print(err); raise SystemExit(0 if result == 0 else 1)"]
+
+                [security]
+                seccomp_profile = "compat"
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("seccomp-compat-ptrace")),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("0"));
+        assert_eq!(lines.next(), Some("0"));
+    }
+
     fn unique_artifact_dir(prefix: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
