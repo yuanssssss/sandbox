@@ -242,7 +242,7 @@ struct NamespaceSupport {
 }
 
 fn probe_namespace_support() -> NamespaceSupport {
-    let user_probe = probe_unshare_support(libc::CLONE_NEWUSER);
+    let user_probe = probe_user_namespace_support();
     let mount_probe = probe_unshare_support(libc::CLONE_NEWNS);
     let pid_probe = probe_unshare_support(libc::CLONE_NEWPID);
     let network_probe = probe_unshare_support(libc::CLONE_NEWNET);
@@ -260,6 +260,75 @@ fn probe_namespace_support() -> NamespaceSupport {
         ipc_namespace: ipc_probe.is_ok(),
         ipc_reason: ipc_probe.err(),
     }
+}
+
+fn probe_user_namespace_support() -> std::result::Result<(), String> {
+    let pid = unsafe { libc::fork() };
+    if pid == -1 {
+        return Err(format!(
+            "fork failed while probing namespace support: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    if pid == 0 {
+        let outside_uid = unsafe { libc::geteuid() } as u32;
+        let outside_gid = unsafe { libc::getegid() } as u32;
+        let code = match probe_user_namespace_identity_mapping(outside_uid, outside_gid) {
+            Ok(()) => 0,
+            Err(err) => err.raw_os_error().unwrap_or(1),
+        };
+        unsafe { libc::_exit(code.min(255)) }
+    }
+
+    let status = waitpid_status(pid)?;
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        if code == 0 {
+            return Ok(());
+        }
+        return Err(format!(
+            "{} failed with errno {} ({})",
+            namespace_name(libc::CLONE_NEWUSER),
+            code,
+            std::io::Error::from_raw_os_error(code)
+        ));
+    }
+
+    Err("user namespace probe did not exit normally".to_string())
+}
+
+fn probe_user_namespace_identity_mapping(
+    outside_uid: u32,
+    outside_gid: u32,
+) -> std::io::Result<()> {
+    let result = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if let Err(err) = fs::write("/proc/self/setgroups", "deny") {
+        if err.kind() != std::io::ErrorKind::NotFound
+            && err.kind() != std::io::ErrorKind::PermissionDenied
+        {
+            return Err(err);
+        }
+    }
+
+    fs::write("/proc/self/uid_map", format!("0 {outside_uid} 1\n"))?;
+    fs::write("/proc/self/gid_map", format!("0 {outside_gid} 1\n"))?;
+
+    let setgid_result = unsafe { libc::setgid(0) };
+    if setgid_result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let setuid_result = unsafe { libc::setuid(0) };
+    if setuid_result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 fn probe_unshare_support(flag: libc::c_int) -> std::result::Result<(), String> {
@@ -436,11 +505,16 @@ fn configure_user_namespace_identity(
     let outside_gid = filesystem.outside_gid.unwrap_or(parent_outside_gid);
 
     if filesystem.deny_setgroups {
-        fs::write("/proc/self/setgroups", "deny")
-            .or_else(ignore_missing_setgroups_file)
-            .map_err(|err| {
-                std::io::Error::other(format!("writing /proc/self/setgroups failed: {err}"))
-            })?;
+        match fs::write("/proc/self/setgroups", "deny") {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(err) => {
+                return Err(std::io::Error::other(format!(
+                    "writing /proc/self/setgroups failed: {err}"
+                )));
+            }
+        }
     }
 
     fs::write(
@@ -465,14 +539,6 @@ fn configure_user_namespace_identity(
     })?;
 
     Ok(())
-}
-
-fn ignore_missing_setgroups_file(err: std::io::Error) -> std::io::Result<()> {
-    if err.kind() == std::io::ErrorKind::NotFound {
-        Ok(())
-    } else {
-        Err(err)
-    }
 }
 
 fn enter_optional_namespaces(filesystem: &sandbox_config::FilesystemConfig) -> std::io::Result<()> {
@@ -777,7 +843,7 @@ mod tests {
     #[test]
     fn reports_capability_error_when_mount_namespace_is_unavailable() {
         let support = probe_namespace_support();
-        if support.mount_namespace {
+        if !support.user_namespace || support.mount_namespace {
             return;
         }
 
