@@ -1,0 +1,40 @@
+minimum_pre_commit_version: "4.0.0"
+fail_fast: false
+
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        files: '(^Cargo\.(toml|lock)$)|(^crates/.*\.rs$)|(^configs/.*\.toml$)'
+
+      - id: cargo-check
+        name: cargo check
+        entry: cargo check
+        language: system
+        pass_filenames: false
+        files: '(^Cargo\.(toml|lock)$)|(^crates/)|(^configs/)'
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test
+        language: system
+        pass_filenames: false
+        files: '(^Cargo\.(toml|lock)$)|(^crates/)|(^configs/)'
+
+      - id: cargo-deny
+        name: cargo deny
+        entry: cargo deny check bans licenses sources
+        language: system
+        pass_filenames: false
+        files: '(^Cargo\.(toml|lock)$)|(^crates/)|(^deny\.toml$)'
+
+      - id: typos
+        name: typos
+        entry: typos --config .typos.toml
+        language: system
+        files: '(^README\.md$)|(^docs/.*\.md$)|(^configs/.*\.toml$)|(^crates/.*\.(rs|toml)$)|(^\.pre-commit-config\.yaml$)|(^deny\.toml$)|(^\.typos\.toml$)'
+

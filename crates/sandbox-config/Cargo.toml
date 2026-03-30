@@ -1,0 +1,12 @@
+[package]
+name = "sandbox-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sandbox-core = { path = "../sandbox-core" }
+serde.workspace = true
+toml.workspace = true
+

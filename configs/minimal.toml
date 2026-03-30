@@ -1,0 +1,15 @@
+[process]
+argv = ["/bin/echo", "hello from sandbox"]
+cwd = "."
+env = ["LANG=C", "PATH=/usr/bin:/bin"]
+clear_env = true
+
+[limits]
+wall_time_ms = 1000
+cpu_time_ms = 1000
+memory_bytes = 134217728
+max_processes = 32
+
+[io]
+artifact_dir = ".sandbox-runs/example"
+

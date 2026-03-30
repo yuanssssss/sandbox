@@ -1,0 +1,12 @@
+[package]
+name = "sandbox-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sandbox-config = { path = "../sandbox-config" }
+sandbox-core = { path = "../sandbox-core" }
+serde.workspace = true
+

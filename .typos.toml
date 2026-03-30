@@ -1,0 +1,14 @@
+[files]
+extend-exclude = [
+    "Cargo.lock",
+    "docs/*.pdf",
+]
+
+[default]
+extend-ignore-re = [
+    "seccomp-bpf",
+]
+
+[default.extend-words]
+crate = "crate"
+EOF = "EOF"
