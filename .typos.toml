@@ -10,5 +10,7 @@ extend-ignore-re = [
 ]
 
 [default.extend-words]
+CapInh = "CapInh"
 crate = "crate"
 EOF = "EOF"
+inh = "inh"

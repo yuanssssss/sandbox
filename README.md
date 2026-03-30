@@ -26,7 +26,7 @@
   - 已接入默认关闭的 `enter_mount_namespace` / `apply_mounts` / `chroot_to_rootfs` 开关
   - 已支持把可执行目录单独绑定进 rootfs，例如 `/bin`、`/usr/bin`
   - 已补环境能力探测，在不支持 namespace 的环境里会给出明确错误
-  - 已接入默认关闭的 `user namespace` 开关与基础 capability drop 骨架
+  - 已接入默认关闭的 `user namespace` 开关，并在执行前完成 `no_new_privs`、bounding set 与 capability sets 降权
   - 已接入 `PID namespace` 流程，并把 `/proc` 的挂载时机延后到新的 pid 视图中
   - 已接入默认关闭的 `network namespace` / `IPC namespace` 开关与能力探测
 

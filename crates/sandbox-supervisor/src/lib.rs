@@ -111,13 +111,6 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
                     );
                     err
                 })?;
-                drop_capabilities().map_err(|err| {
-                    let _ = fs::write(
-                        artifact_dir.join("rootfs-preexec-error.log"),
-                        format!("drop_capabilities failed: {err}"),
-                    );
-                    err
-                })?;
             }
             if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
                 enter_optional_namespaces(&filesystem).map_err(|err| {
@@ -172,6 +165,15 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
                         std::io::Error::other(err)
                     })?;
                 }
+            }
+            if filesystem.enter_user_namespace && filesystem.drop_capabilities {
+                drop_capabilities().map_err(|err| {
+                    let _ = fs::write(
+                        artifact_dir.join("rootfs-preexec-error.log"),
+                        format!("drop_capabilities failed: {err}"),
+                    );
+                    err
+                })?;
             }
             Ok(())
         });
@@ -525,6 +527,13 @@ fn enter_user_namespace(
 }
 
 fn drop_capabilities() -> std::io::Result<()> {
+    set_no_new_privs()?;
+    drop_capability_bounding_set()?;
+    clear_capability_sets()?;
+    Ok(())
+}
+
+fn set_no_new_privs() -> std::io::Result<()> {
     let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if result == -1 {
         let err = std::io::Error::last_os_error();
@@ -534,6 +543,79 @@ fn drop_capabilities() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+fn drop_capability_bounding_set() -> std::io::Result<()> {
+    for cap in 0..=read_cap_last_cap() {
+        let result = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
+        if result == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                return Ok(());
+            }
+            return Err(std::io::Error::other(format!(
+                "dropping capability {cap} from bounding set failed: {err}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn clear_capability_sets() -> std::io::Result<()> {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    #[repr(C)]
+    struct UserCapHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    struct UserCapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let mut header = UserCapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [
+        UserCapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        UserCapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &mut header as *mut UserCapHeader,
+            data.as_ptr(),
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::other(format!(
+            "clearing effective/permitted/inheritable capabilities failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    Ok(())
+}
+
+fn read_cap_last_cap() -> u32 {
+    fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(63)
 }
 
 fn configure_user_namespace_identity(
@@ -1336,6 +1418,48 @@ mod tests {
         let mut lines = stdout.lines();
         assert_eq!(lines.next(), Some("0"));
         assert_eq!(lines.next(), Some("0"));
+    }
+
+    #[test]
+    #[ignore = "requires user namespace support in the test environment"]
+    fn drops_capabilities_after_namespace_setup() {
+        let support = probe_namespace_support();
+        if !support.user_namespace {
+            return;
+        }
+
+        let artifact_dir = unique_artifact_dir("caps-drop");
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "grep '^NoNewPrivs:' /proc/self/status && grep '^CapEff:' /proc/self/status && grep '^CapPrm:' /proc/self/status && grep '^CapInh:' /proc/self/status && grep '^CapBnd:' /proc/self/status"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_user_namespace = true
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert!(stdout.contains("NoNewPrivs:\t1"));
+        assert!(stdout.contains("CapEff:\t0000000000000000"));
+        assert!(stdout.contains("CapPrm:\t0000000000000000"));
+        assert!(stdout.contains("CapInh:\t0000000000000000"));
+        assert!(stdout.contains("CapBnd:\t0000000000000000"));
     }
 
     fn unique_artifact_dir(prefix: &str) -> PathBuf {

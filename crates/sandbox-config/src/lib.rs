@@ -145,6 +145,8 @@ pub struct FilesystemConfig {
     pub outside_gid: Option<u32>,
     #[serde(default = "default_deny_setgroups")]
     pub deny_setgroups: bool,
+    #[serde(default = "default_drop_capabilities")]
+    pub drop_capabilities: bool,
     #[serde(default = "default_work_dir")]
     pub work_dir: PathBuf,
     #[serde(default = "default_tmp_dir")]
@@ -174,6 +176,7 @@ impl Default for FilesystemConfig {
             outside_uid: None,
             outside_gid: None,
             deny_setgroups: default_deny_setgroups(),
+            drop_capabilities: default_drop_capabilities(),
             work_dir: default_work_dir(),
             tmp_dir: default_tmp_dir(),
             runtime_bind_paths: default_runtime_bind_paths(),
@@ -327,6 +330,10 @@ const fn default_deny_setgroups() -> bool {
     true
 }
 
+const fn default_drop_capabilities() -> bool {
+    true
+}
+
 fn default_work_dir() -> PathBuf {
     PathBuf::from("/work")
 }
@@ -400,6 +407,7 @@ mod tests {
         assert_eq!(config.filesystem.outside_uid, None);
         assert_eq!(config.filesystem.outside_gid, None);
         assert!(config.filesystem.deny_setgroups);
+        assert!(config.filesystem.drop_capabilities);
         assert_eq!(config.filesystem.work_dir, PathBuf::from("/work"));
         assert_eq!(config.filesystem.tmp_dir, PathBuf::from("/tmp"));
         assert!(config.filesystem.mount_proc);

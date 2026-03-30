@@ -23,7 +23,9 @@ impl Scenario {
             Self::NetworkIsolationProbe => {
                 "test -r /proc/net/dev && test $(grep -Ec '^[[:space:]]*[^ :]+:' /proc/net/dev) -le 1"
             }
-            Self::IpcIsolationProbe => "test -w /proc/sysvipc || test ! -e /proc/sysvipc",
+            Self::IpcIsolationProbe => {
+                "test -r /proc/sysvipc/shm && test $(wc -l < /proc/sysvipc/shm) -le 1 && test -r /proc/sysvipc/msg && test $(wc -l < /proc/sysvipc/msg) -le 1 && test -r /proc/sysvipc/sem && test $(wc -l < /proc/sysvipc/sem) -le 1"
+            }
             Self::UserNamespaceProbe => "id -u && id -g",
         }
     }
