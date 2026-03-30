@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use sandbox_config::ExecutionConfig;
+use sandbox_core::{ExecutionResult, ExecutionStatus};
 use sandbox_supervisor::{RunOptions, run};
 use tracing_subscriber::EnvFilter;
 
@@ -36,6 +37,8 @@ struct RunArgs {
     config: PathBuf,
     #[arg(long)]
     artifact_dir: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = ResultFormat::Pretty)]
+    result_format: ResultFormat,
     #[arg(long, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -44,6 +47,12 @@ struct RunArgs {
 struct ValidateArgs {
     #[arg(long)]
     config: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ResultFormat {
+    Pretty,
+    Json,
 }
 
 fn main() -> Result<()> {
@@ -85,7 +94,10 @@ fn run_command(args: RunArgs) -> Result<()> {
         },
     )?;
 
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    match args.result_format {
+        ResultFormat::Pretty => print_pretty_result(&result),
+        ResultFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+    }
     std::process::exit(result.status.process_exit_code());
 }
 
@@ -103,4 +115,71 @@ fn validate_command(args: ValidateArgs) -> Result<()> {
         limits.max_processes
     );
     Ok(())
+}
+
+fn print_pretty_result(result: &ExecutionResult) {
+    println!("status: {}", status_label(&result.status));
+    println!("command: {:?}", result.command);
+    println!("exit_code: {}", format_optional_i32(result.exit_code));
+    println!("term_signal: {}", format_optional_i32(result.term_signal));
+    println!("wall_time_ms: {}", result.usage.wall_time_ms);
+    println!(
+        "cpu_time_ms: {}",
+        format_optional_u64(result.usage.cpu_time_ms)
+    );
+    println!(
+        "memory_peak_bytes: {}",
+        format_optional_u64(result.usage.memory_peak_bytes)
+    );
+    println!("stdout: {}", result.stdout_path.display());
+    println!("stderr: {}", result.stderr_path.display());
+}
+
+fn status_label(status: &ExecutionStatus) -> &'static str {
+    match status {
+        ExecutionStatus::Ok => "ok",
+        ExecutionStatus::TimeLimitExceeded => "time_limit_exceeded",
+        ExecutionStatus::WallTimeLimitExceeded => "wall_time_limit_exceeded",
+        ExecutionStatus::MemoryLimitExceeded => "memory_limit_exceeded",
+        ExecutionStatus::OutputLimitExceeded => "output_limit_exceeded",
+        ExecutionStatus::RuntimeError => "runtime_error",
+        ExecutionStatus::SandboxError => "sandbox_error",
+    }
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|current| current.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_optional_i32(value: Option<i32>) -> String {
+    value
+        .map(|current| current.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_optional_i32, format_optional_u64, status_label};
+    use sandbox_core::ExecutionStatus;
+
+    #[test]
+    fn formats_missing_numeric_fields_as_na() {
+        assert_eq!(format_optional_u64(None), "n/a");
+        assert_eq!(format_optional_i32(None), "n/a");
+    }
+
+    #[test]
+    fn exposes_human_readable_status_labels() {
+        assert_eq!(status_label(&ExecutionStatus::Ok), "ok");
+        assert_eq!(
+            status_label(&ExecutionStatus::MemoryLimitExceeded),
+            "memory_limit_exceeded"
+        );
+        assert_eq!(
+            status_label(&ExecutionStatus::WallTimeLimitExceeded),
+            "wall_time_limit_exceeded"
+        );
+    }
 }
