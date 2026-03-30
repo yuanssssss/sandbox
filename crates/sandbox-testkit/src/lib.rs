@@ -20,7 +20,9 @@ impl Scenario {
             Self::WorkDirWriteProbe => "pwd && touch /work/probe.txt && test -f /work/probe.txt",
             Self::HostVisibilityProbe => "test ! -e /host-secret.txt",
             Self::ProcVisibilityProbe => "test -d /proc && test -r /proc/self/status",
-            Self::NetworkIsolationProbe => "test ! -e /proc/net/dev",
+            Self::NetworkIsolationProbe => {
+                "test -r /proc/net/dev && [ \"$(grep -Ec '^[[:space:]]*[^ :]+:' /proc/net/dev)\" -le 1 ]"
+            }
             Self::IpcIsolationProbe => "test -w /proc/sysvipc || test ! -e /proc/sysvipc",
             Self::UserNamespaceProbe => "id -u && id -g",
         }
