@@ -70,13 +70,38 @@ impl ResourceScenario {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeccompScenario {
+    ShellRuntime,
+    PythonRuntime,
+}
+
+impl SeccompScenario {
+    pub fn argv(self) -> Vec<String> {
+        match self {
+            Self::ShellRuntime => vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "set -eu; value=$(printf 'shell-ok'); [ \"$value\" = 'shell-ok' ]; printf '%s\\n' \"$value\""
+                    .to_string(),
+            ],
+            Self::PythonRuntime => vec![
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                "import hashlib, json, subprocess; digest = hashlib.sha256(b'sandbox').hexdigest()[:8]; completed = subprocess.run(['/bin/echo', digest], check=True, capture_output=True, text=True); payload = json.loads(json.dumps({'digest': completed.stdout.strip()})); print(payload['digest'])"
+                    .to_string(),
+            ],
+        }
+    }
+}
+
 pub fn roadmap() -> &'static str {
     "M6 scaffold: add malicious samples, regression fixtures, and pressure scenarios."
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ResourceScenario;
+    use super::{ResourceScenario, SeccompScenario};
 
     #[test]
     fn resource_scenarios_emit_python_commands() {
@@ -92,6 +117,19 @@ mod tests {
             assert_eq!(argv[0], "/usr/bin/python3");
             assert_eq!(argv[1], "-c");
             assert!(!argv[2].trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn seccomp_scenarios_emit_commands() {
+        for scenario in [
+            SeccompScenario::ShellRuntime,
+            SeccompScenario::PythonRuntime,
+        ] {
+            let argv = scenario.argv();
+            assert!(!argv.is_empty());
+            assert!(!argv[0].trim().is_empty());
+            assert!(!argv[argv.len() - 1].trim().is_empty());
         }
     }
 }

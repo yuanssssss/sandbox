@@ -985,7 +985,7 @@ mod tests {
     use sandbox_cgroup::{CgroupManager, CgroupPlan};
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{ExecutionStatus, SandboxError};
-    use sandbox_testkit::{ResourceScenario, Scenario};
+    use sandbox_testkit::{ResourceScenario, Scenario, SeccompScenario};
 
     use crate::{RunOptions, cgroup_scope_name, probe_namespace_support, rootfs_cwd, run};
 
@@ -1773,6 +1773,101 @@ mod tests {
     }
 
     #[test]
+    fn default_seccomp_profile_keeps_shell_runtime_compatible() {
+        let config = seccomp_runtime_config(SeccompScenario::ShellRuntime, Some("default"));
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("seccomp-default-shell-runtime")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "shell-ok");
+    }
+
+    #[test]
+    fn default_seccomp_profile_keeps_python_runtime_compatible() {
+        let config = seccomp_runtime_config(SeccompScenario::PythonRuntime, Some("default"));
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("seccomp-default-python-runtime")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "b7ad5674");
+    }
+
+    #[test]
+    fn compat_seccomp_profile_keeps_python_runtime_compatible() {
+        let config = seccomp_runtime_config(SeccompScenario::PythonRuntime, Some("compat"));
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("seccomp-compat-python-runtime")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "b7ad5674");
+    }
+
+    #[test]
+    fn strict_seccomp_profile_keeps_python_runtime_compatible() {
+        let config = seccomp_runtime_config(SeccompScenario::PythonRuntime, Some("strict"));
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("seccomp-strict-python-runtime")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "b7ad5674");
+    }
+
+    #[test]
+    fn strict_seccomp_profile_keeps_shell_runtime_compatible() {
+        let config = seccomp_runtime_config(SeccompScenario::ShellRuntime, Some("strict"));
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("seccomp-strict-shell-runtime")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "shell-ok");
+    }
+
+    #[test]
     fn reads_cgroup_usage_and_cleans_up_when_limits_are_enabled() {
         let artifact_dir = unique_artifact_dir("cgroup-usage");
         let cgroup_root = unique_artifact_dir("cgroup-root");
@@ -2179,6 +2274,24 @@ mod tests {
 
                 [limits]
                 {limits_body}
+            "#
+        ))
+        .expect("config should parse")
+    }
+
+    fn seccomp_runtime_config(
+        scenario: SeccompScenario,
+        seccomp_profile: Option<&str>,
+    ) -> ExecutionConfig {
+        let argv = format!("{:?}", scenario.argv());
+        let security = seccomp_profile
+            .map(|profile| format!("\n[security]\nseccomp_profile = \"{profile}\"\n"))
+            .unwrap_or_default();
+        ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = {argv}
+                {security}
             "#
         ))
         .expect("config should parse")

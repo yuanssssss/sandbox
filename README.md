@@ -43,6 +43,7 @@
   - `default` profile 会拦截高风险 syscall，例如 `mount`、`unshare`、`ptrace`、`bpf`
   - `compat` profile 比 `default` 更宽松，保留 `ptrace`
   - `strict` profile 在 `default` 基础上进一步阻止网络 socket 创建
+  - 已补 `sh` / `python3` 在 `default`、`compat`、`strict` 下的兼容性回归，避免误伤常见运行时
 
 ## Workspace 结构
 
