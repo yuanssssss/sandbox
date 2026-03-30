@@ -324,6 +324,7 @@ name = "sandbox-supervisor"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "sandbox-cgroup",
  "sandbox-config",
  "sandbox-core",
  "sandbox-mount",

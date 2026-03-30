@@ -5,6 +5,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use sandbox_cgroup::{CgroupManager, CgroupPlan};
 use sandbox_config::ExecutionConfig;
 use sandbox_core::{ExecutionResult, ExecutionStatus, ResourceUsage, Result, SandboxError};
 use sandbox_mount::{
@@ -18,6 +19,7 @@ use tracing::{info, warn};
 pub struct RunOptions {
     pub argv_override: Option<Vec<String>>,
     pub artifact_dir: Option<PathBuf>,
+    pub cgroup_root_override: Option<PathBuf>,
 }
 
 pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionResult> {
@@ -55,6 +57,8 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
     }
 
     ensure_namespace_support(&config)?;
+
+    let cgroup_binding = prepare_cgroup_context(config, &artifact_dir, options)?;
 
     let stdout_path = resolve_output_path(
         &artifact_dir,
@@ -199,26 +203,101 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
             .unwrap_or_else(|| err.to_string());
         SandboxError::Spawn(detail)
     })?;
+    if let Some(binding) = &cgroup_binding {
+        binding
+            .manager
+            .attach_pid(&binding.plan, child.id())
+            .map_err(|err| {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = binding.manager.cleanup(&binding.plan);
+                err
+            })?;
+    }
     let wall_limit = Duration::from_millis(config.limits.wall_time_ms);
     let wait_outcome = wait_for_exit(&mut child, wall_limit)?;
 
     let status = classify_status(wait_outcome.timed_out, &wait_outcome.exit_status);
     let term_signal = wait_outcome.exit_status.signal();
     let exit_code = wait_outcome.exit_status.code();
+    let usage = finalize_resource_usage(cgroup_binding.as_ref(), wait_outcome.elapsed)?;
 
     Ok(ExecutionResult {
         command,
         exit_code,
         term_signal,
-        usage: ResourceUsage {
-            cpu_time_ms: None,
-            wall_time_ms: wait_outcome.elapsed.as_millis() as u64,
-            memory_peak_bytes: None,
-        },
+        usage,
         stdout_path,
         stderr_path,
         status,
     })
+}
+
+#[derive(Debug, Clone)]
+struct CgroupBinding {
+    manager: CgroupManager,
+    plan: CgroupPlan,
+}
+
+fn prepare_cgroup_context(
+    config: &ExecutionConfig,
+    artifact_dir: &Path,
+    options: &RunOptions,
+) -> Result<Option<CgroupBinding>> {
+    if !should_enable_cgroup(config) {
+        return Ok(None);
+    }
+
+    let manager = match &options.cgroup_root_override {
+        Some(path) => CgroupManager::new(path.clone()),
+        None => CgroupManager::probe_v2_root()?,
+    };
+    let plan = CgroupPlan::new(cgroup_scope_name(artifact_dir), config.resource_limits());
+    manager.apply_limits(&plan)?;
+
+    Ok(Some(CgroupBinding { manager, plan }))
+}
+
+fn should_enable_cgroup(config: &ExecutionConfig) -> bool {
+    config.limits.memory_bytes.is_some() || config.limits.max_processes.is_some()
+}
+
+fn cgroup_scope_name(artifact_dir: &Path) -> String {
+    artifact_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(ToOwned::to_owned)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("sandbox-{stamp}")
+        })
+}
+
+fn finalize_resource_usage(
+    cgroup_binding: Option<&CgroupBinding>,
+    elapsed: Duration,
+) -> Result<ResourceUsage> {
+    let wall_time_ms = elapsed.as_millis() as u64;
+    let mut usage = ResourceUsage {
+        cpu_time_ms: None,
+        wall_time_ms,
+        memory_peak_bytes: None,
+    };
+
+    let Some(binding) = cgroup_binding else {
+        return Ok(usage);
+    };
+
+    let stats = binding.manager.read_usage(&binding.plan);
+    let cleanup_result = binding.manager.cleanup(&binding.plan);
+    let stats = stats?;
+    cleanup_result?;
+    usage = stats.into_resource_usage(wall_time_ms);
+    Ok(usage)
 }
 
 fn rootfs_cwd(config: &ExecutionConfig) -> Option<PathBuf> {
@@ -807,14 +886,14 @@ fn classify_status(timed_out: bool, exit_status: &ExitStatus) -> ExecutionStatus
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{ExecutionStatus, SandboxError};
     use sandbox_testkit::Scenario;
 
-    use crate::{RunOptions, probe_namespace_support, rootfs_cwd, run};
+    use crate::{RunOptions, cgroup_scope_name, probe_namespace_support, rootfs_cwd, run};
 
     #[test]
     fn executes_simple_command() {
@@ -834,6 +913,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("echo")),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -863,6 +943,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("timeout")),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -892,6 +973,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir.clone()),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -926,6 +1008,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -997,6 +1080,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("unsupported-mount")),
+                cgroup_root_override: None,
             },
         )
         .expect_err("run should fail");
@@ -1033,6 +1117,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("unsupported-user")),
+                cgroup_root_override: None,
             },
         )
         .expect_err("run should fail");
@@ -1070,6 +1155,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("unsupported-network")),
+                cgroup_root_override: None,
             },
         )
         .expect_err("run should fail");
@@ -1107,6 +1193,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("unsupported-ipc")),
+                cgroup_root_override: None,
             },
         )
         .expect_err("run should fail");
@@ -1155,6 +1242,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir.clone()),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1202,6 +1290,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1246,6 +1335,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1295,6 +1385,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1344,6 +1435,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1380,6 +1472,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1419,6 +1512,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1459,6 +1553,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(artifact_dir),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1490,6 +1585,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("seccomp-strict-socket")),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1514,6 +1610,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("seccomp-default")),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1539,6 +1636,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("seccomp-default-ptrace")),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1568,6 +1666,7 @@ mod tests {
             &RunOptions {
                 argv_override: None,
                 artifact_dir: Some(unique_artifact_dir("seccomp-compat-ptrace")),
+                cgroup_root_override: None,
             },
         )
         .expect("command should run");
@@ -1579,11 +1678,92 @@ mod tests {
         assert_eq!(lines.next(), Some("0"));
     }
 
+    #[test]
+    fn reads_cgroup_usage_and_cleans_up_when_limits_are_enabled() {
+        let artifact_dir = unique_artifact_dir("cgroup-usage");
+        let cgroup_root = unique_artifact_dir("cgroup-root");
+        fs::create_dir_all(&cgroup_root).expect("cgroup root should exist");
+        fs::write(cgroup_root.join("cgroup.controllers"), "memory pids cpu\n")
+            .expect("controllers should exist");
+        let cgroup_dir = cgroup_root.join(cgroup_scope_name(&artifact_dir));
+
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "printf 'usage_usec 7000\n' > {cpu_stat}; printf '4096\n' > {memory_current}; printf '16384\n' > {memory_peak}; printf '2\n' > {pids_current}"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 16384
+                max_processes = 8
+            "#,
+            cpu_stat = shell_single_quote(&cgroup_dir.join("cpu.stat")),
+            memory_current = shell_single_quote(&cgroup_dir.join("memory.current")),
+            memory_peak = shell_single_quote(&cgroup_dir.join("memory.peak")),
+            pids_current = shell_single_quote(&cgroup_dir.join("pids.current")),
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+                cgroup_root_override: Some(cgroup_root),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        assert_eq!(result.usage.cpu_time_ms, Some(7));
+        assert_eq!(result.usage.memory_peak_bytes, Some(16_384));
+        assert!(
+            !cgroup_dir.exists(),
+            "cgroup directory should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn reports_capability_error_when_cgroup_v2_root_is_unavailable() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 4096
+            "#,
+        )
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("cgroup-unavailable")),
+                cgroup_root_override: Some(unique_artifact_dir("missing-cgroup-root")),
+            },
+        )
+        .expect_err("run should fail");
+
+        match err {
+            SandboxError::CapabilityUnavailable { capability, .. } => {
+                assert_eq!(capability, "cgroup_v2");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
     fn unique_artifact_dir(prefix: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("sandbox-{prefix}-{stamp}"))
+    }
+
+    fn shell_single_quote(path: &Path) -> String {
+        format!("'{}'", path.display())
     }
 }

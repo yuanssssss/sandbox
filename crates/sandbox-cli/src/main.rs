@@ -81,6 +81,7 @@ fn run_command(args: RunArgs) -> Result<()> {
                 Some(args.command)
             },
             artifact_dir: args.artifact_dir,
+            cgroup_root_override: None,
         },
     )?;
 

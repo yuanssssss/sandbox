@@ -110,7 +110,14 @@ impl CgroupManager {
             return Ok(());
         }
 
-        fs::remove_dir(&path).map_err(|err| SandboxError::io("removing cgroup directory", err))
+        match fs::remove_dir(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                fs::remove_dir_all(&path)
+                    .map_err(|fallback| SandboxError::io("removing cgroup directory", fallback))
+            }
+            Err(err) => Err(SandboxError::io("removing cgroup directory", err)),
+        }
     }
 }
 
