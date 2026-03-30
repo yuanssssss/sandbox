@@ -96,10 +96,15 @@ impl CgroupManager {
         write_control_file(&path.join("cgroup.procs"), &pid.to_string())
     }
 
+    pub fn read_cpu_time_usec(&self, plan: &CgroupPlan) -> Result<Option<u64>> {
+        let path = plan.path_under(&self.root);
+        parse_key_value_file(&path.join("cpu.stat"), "usage_usec")
+    }
+
     pub fn read_usage(&self, plan: &CgroupPlan) -> Result<CgroupUsage> {
         let path = plan.path_under(&self.root);
         Ok(CgroupUsage {
-            cpu_time_usec: parse_key_value_file(&path.join("cpu.stat"), "usage_usec")?,
+            cpu_time_usec: self.read_cpu_time_usec(plan)?,
             memory_current_bytes: parse_single_u64_file(&path.join("memory.current"))?,
             memory_peak_bytes: parse_single_u64_file(&path.join("memory.peak"))?,
             pids_current: parse_single_u64_file(&path.join("pids.current"))?,
@@ -294,6 +299,12 @@ mod tests {
         assert_eq!(
             fs::read_to_string(path.join("cgroup.procs")).expect("cgroup.procs should exist"),
             "4242\n"
+        );
+        assert_eq!(
+            manager
+                .read_cpu_time_usec(&plan)
+                .expect("cpu time should read"),
+            Some(12_345)
         );
     }
 

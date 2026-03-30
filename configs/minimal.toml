@@ -6,8 +6,9 @@ clear_env = true
 
 [limits]
 wall_time_ms = 1000
-cpu_time_ms = 1000
 # 默认示例不主动启用 cgroup 限额，便于在普通开发环境直接运行。
+# 如需启用 CPU cgroup 限额：
+# cpu_time_ms = 1000
 # 如需启用 cgroup v2：
 # memory_bytes = 134217728
 # max_processes = 32

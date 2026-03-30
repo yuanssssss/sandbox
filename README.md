@@ -34,9 +34,10 @@
   - 已接入 `security.seccomp_profile` 的真实过滤器：`default`、`compat`、`strict`
 - `M3` cgroup v2：
   - 已实现 cgroup v2 root 探测、scope 路径规划、目录创建与清理
-  - 已接入 `memory.max`、`memory.swap.max`、`pids.max` 写入
+  - 已接入 `memory.max`、`memory.swap.max`、`pids.max`，以及基于 `cpu.stat` 轮询的 CPU time limit
   - 已在 supervisor 中接入 cgroup 创建、PID attach、usage 读取与清理
   - 已把 `cpu.stat` / `memory.peak` 等结果回填到 `ExecutionResult.usage`
+  - 已把 `cpu_time_ms` 超限映射为 `TimeLimitExceeded`
   - 已把 `memory.events` / `memory.events.local` 中的 OOM 信号映射为 `MemoryLimitExceeded`
 - `M4` seccomp：
   - `default` profile 会拦截高风险 syscall，例如 `mount`、`unshare`、`ptrace`、`bpf`
@@ -78,11 +79,11 @@ cargo run -p sandbox-cli -- run --config configs/minimal.toml
 
 - 默认启用 `security.seccomp_profile = "default"`
 - 默认不启用 mount / pid / network / ipc / user namespace
-- 默认不启用 cgroup 限额写入
+- 默认不启用 cgroup 限额写入，`cpu_time_ms` / `memory_bytes` / `max_processes` 需要按需打开
 
 如果你要开启更强隔离：
 
-- 设置 `limits.memory_bytes` 或 `limits.max_processes` 会启用 cgroup v2，要求宿主机提供可写 cgroup v2
+- 设置 `limits.cpu_time_ms`、`limits.memory_bytes` 或 `limits.max_processes` 会启用 cgroup v2，要求宿主机提供可写 cgroup v2
 - 设置 `filesystem.enter_user_namespace` / `enter_mount_namespace` / `enter_pid_namespace` 等开关时，要求宿主机支持对应 namespace
 
 一个更强的配置通常至少会包含：
@@ -116,8 +117,8 @@ cargo run -p sandbox-cli -- run --config configs/minimal.toml --command /bin/ech
 
 1. 把 cgroup v2 的 CPU 控制与更完整统计接上
 2. 继续扩 seccomp profile 与 deny-list 覆盖
-3. 补 CLI / README 中的资源超限结果展示
-4. 继续做 mount / cgroup / 子进程失败路径的清理加固
+3. 继续做 mount / cgroup / 子进程失败路径的清理加固
+4. 补审计日志和更细的用户可见错误报告
 
 ## 验证
 

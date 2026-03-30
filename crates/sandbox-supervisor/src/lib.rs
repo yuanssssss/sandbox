@@ -215,11 +215,24 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
             })?;
     }
     let wall_limit = Duration::from_millis(config.limits.wall_time_ms);
-    let wait_outcome = wait_for_exit(&mut child, wall_limit)?;
+    let wait_outcome = wait_for_exit(
+        &mut child,
+        wall_limit,
+        config.limits.cpu_time_ms,
+        cgroup_binding.as_ref(),
+    )?;
 
-    let finalized_cgroup = finalize_cgroup(cgroup_binding.as_ref(), wait_outcome.elapsed)?;
+    let finalized_cgroup = finalize_cgroup(
+        cgroup_binding.as_ref(),
+        wait_outcome.elapsed,
+        config.limits.cpu_time_ms,
+    )?;
     let status = classify_status(
         wait_outcome.timed_out,
+        wait_outcome.cpu_timed_out
+            || finalized_cgroup
+                .as_ref()
+                .is_some_and(|value| value.cpu_limit_exceeded),
         &wait_outcome.exit_status,
         finalized_cgroup
             .as_ref()
@@ -255,6 +268,7 @@ struct CgroupBinding {
 #[derive(Debug, Clone)]
 struct FinalizedCgroup {
     usage: ResourceUsage,
+    cpu_limit_exceeded: bool,
     memory_limit_exceeded: bool,
 }
 
@@ -278,7 +292,9 @@ fn prepare_cgroup_context(
 }
 
 fn should_enable_cgroup(config: &ExecutionConfig) -> bool {
-    config.limits.memory_bytes.is_some() || config.limits.max_processes.is_some()
+    config.limits.cpu_time_ms.is_some()
+        || config.limits.memory_bytes.is_some()
+        || config.limits.max_processes.is_some()
 }
 
 fn cgroup_scope_name(artifact_dir: &Path) -> String {
@@ -299,6 +315,7 @@ fn cgroup_scope_name(artifact_dir: &Path) -> String {
 fn finalize_cgroup(
     cgroup_binding: Option<&CgroupBinding>,
     elapsed: Duration,
+    cpu_time_limit_ms: Option<u64>,
 ) -> Result<Option<FinalizedCgroup>> {
     let wall_time_ms = elapsed.as_millis() as u64;
     let Some(binding) = cgroup_binding else {
@@ -309,11 +326,17 @@ fn finalize_cgroup(
     let cleanup_result = binding.manager.cleanup(&binding.plan);
     let stats = stats?;
     cleanup_result?;
+    let cpu_limit_exceeded = cpu_time_limit_ms.is_some_and(|limit_ms| {
+        stats
+            .cpu_time_usec
+            .is_some_and(|observed| observed >= limit_ms.saturating_mul(1_000))
+    });
     let memory_limit_exceeded =
         stats.memory_events_oom.unwrap_or(0) > 0 || stats.memory_events_oom_kill.unwrap_or(0) > 0;
     let usage = stats.into_resource_usage(wall_time_ms);
     Ok(Some(FinalizedCgroup {
         usage,
+        cpu_limit_exceeded,
         memory_limit_exceeded,
     }))
 }
@@ -836,9 +859,15 @@ struct WaitOutcome {
     exit_status: ExitStatus,
     elapsed: Duration,
     timed_out: bool,
+    cpu_timed_out: bool,
 }
 
-fn wait_for_exit(child: &mut Child, wall_limit: Duration) -> Result<WaitOutcome> {
+fn wait_for_exit(
+    child: &mut Child,
+    wall_limit: Duration,
+    cpu_time_limit_ms: Option<u64>,
+    cgroup_binding: Option<&CgroupBinding>,
+) -> Result<WaitOutcome> {
     let pid = child.id() as i32;
     let start = Instant::now();
 
@@ -851,6 +880,26 @@ fn wait_for_exit(child: &mut Child, wall_limit: Duration) -> Result<WaitOutcome>
                 exit_status: status,
                 elapsed: start.elapsed(),
                 timed_out: false,
+                cpu_timed_out: false,
+            });
+        }
+
+        if let Some(observed_cpu_time_usec) =
+            check_cpu_time_limit_exceeded(cgroup_binding, cpu_time_limit_ms)?
+        {
+            warn!(
+                pid,
+                cpu_time_limit_ms, observed_cpu_time_usec, "cpu time limit exceeded"
+            );
+            terminate_process_group(pid);
+            let status = child
+                .wait()
+                .map_err(|err| SandboxError::io("collecting cpu-limited child process", err))?;
+            return Ok(WaitOutcome {
+                exit_status: status,
+                elapsed: start.elapsed(),
+                timed_out: false,
+                cpu_timed_out: true,
             });
         }
 
@@ -868,11 +917,28 @@ fn wait_for_exit(child: &mut Child, wall_limit: Duration) -> Result<WaitOutcome>
                 exit_status: status,
                 elapsed: start.elapsed(),
                 timed_out: true,
+                cpu_timed_out: false,
             });
         }
 
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn check_cpu_time_limit_exceeded(
+    cgroup_binding: Option<&CgroupBinding>,
+    cpu_time_limit_ms: Option<u64>,
+) -> Result<Option<u64>> {
+    let Some(limit_ms) = cpu_time_limit_ms else {
+        return Ok(None);
+    };
+    let Some(binding) = cgroup_binding else {
+        return Ok(None);
+    };
+
+    let limit_usec = limit_ms.saturating_mul(1_000);
+    let observed = binding.manager.read_cpu_time_usec(&binding.plan)?;
+    Ok(observed.filter(|value| *value >= limit_usec))
 }
 
 fn terminate_process_group(pid: i32) {
@@ -893,11 +959,14 @@ fn send_signal_to_group(pid: i32, signal: i32) {
 
 fn classify_status(
     timed_out: bool,
+    cpu_timed_out: bool,
     exit_status: &ExitStatus,
     memory_limit_exceeded: bool,
 ) -> ExecutionStatus {
     if timed_out {
         ExecutionStatus::WallTimeLimitExceeded
+    } else if cpu_timed_out {
+        ExecutionStatus::TimeLimitExceeded
     } else if memory_limit_exceeded {
         ExecutionStatus::MemoryLimitExceeded
     } else if exit_status.success() {
@@ -1823,6 +1892,46 @@ mod tests {
     }
 
     #[test]
+    fn maps_cpu_usage_to_time_limit_exceeded_status() {
+        let artifact_dir = unique_artifact_dir("cgroup-cpu-status");
+        let cgroup_root = unique_artifact_dir("cgroup-cpu-root");
+        fs::create_dir_all(&cgroup_root).expect("cgroup root should exist");
+        fs::write(cgroup_root.join("cgroup.controllers"), "memory pids cpu\n")
+            .expect("controllers should exist");
+        let cgroup_dir = cgroup_root.join(cgroup_scope_name(&artifact_dir));
+
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "printf 'usage_usec 45000\n' > {cpu_stat}; exit 0"]
+
+                [limits]
+                wall_time_ms = 1000
+                cpu_time_ms = 40
+            "#,
+            cpu_stat = shell_single_quote(&cgroup_dir.join("cpu.stat")),
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+                cgroup_root_override: Some(cgroup_root),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::TimeLimitExceeded);
+        assert_eq!(result.usage.cpu_time_ms, Some(45));
+        assert!(
+            !cgroup_dir.exists(),
+            "cgroup directory should be cleaned up"
+        );
+    }
+
+    #[test]
     #[ignore = "requires writable cgroup v2 support in the test environment"]
     fn enforces_pids_max_against_fork_attempts() {
         if !supports_writable_cgroup_v2() {
@@ -1888,6 +1997,39 @@ mod tests {
         assert_eq!(result.status, ExecutionStatus::Ok);
         let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
         assert_eq!(stdout.trim(), "True");
+    }
+
+    #[test]
+    #[ignore = "requires writable cgroup v2 support in the test environment"]
+    fn enforces_real_cpu_time_limit_with_busy_loop() {
+        if !supports_writable_cgroup_v2() {
+            return;
+        }
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/usr/bin/python3", "-c", "while True: pass"]
+
+                [limits]
+                wall_time_ms = 3000
+                cpu_time_ms = 100
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("cgroup-cpu-busy-loop")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::TimeLimitExceeded);
+        assert!(result.usage.cpu_time_ms.is_some());
     }
 
     #[test]

@@ -152,10 +152,7 @@ fn print_validate_summary(config: &ExecutionConfig, config_path: &PathBuf) {
         "max_processes: {}",
         format_optional_u64(limits.max_processes)
     );
-    println!(
-        "cgroup_limits_enabled: {}",
-        limits.memory_bytes.is_some() || limits.max_processes.is_some()
-    );
+    println!("cgroup_limits_enabled: {}", cgroup_limits_enabled(&limits));
     println!("seccomp_profile: {:?}", config.security.seccomp_profile);
     println!("rootfs_enabled: {}", filesystem.enable_rootfs);
     println!("mount_proc: {}", filesystem.mount_proc);
@@ -211,6 +208,10 @@ fn status_label(status: &ExecutionStatus) -> &'static str {
     }
 }
 
+fn cgroup_limits_enabled(limits: &sandbox_core::ResourceLimits) -> bool {
+    limits.cpu_time_ms.is_some() || limits.memory_bytes.is_some() || limits.max_processes.is_some()
+}
+
 fn format_optional_u64(value: Option<u64>) -> String {
     value
         .map(|current| current.to_string())
@@ -227,9 +228,12 @@ fn format_optional_i32(value: Option<i32>) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{format_optional_i32, format_optional_u64, print_validate_summary, status_label};
+    use super::{
+        cgroup_limits_enabled, format_optional_i32, format_optional_u64, print_validate_summary,
+        status_label,
+    };
     use sandbox_config::ExecutionConfig;
-    use sandbox_core::ExecutionStatus;
+    use sandbox_core::{ExecutionStatus, ResourceLimits};
 
     #[test]
     fn formats_missing_numeric_fields_as_na() {
@@ -248,6 +252,18 @@ mod tests {
             status_label(&ExecutionStatus::WallTimeLimitExceeded),
             "wall_time_limit_exceeded"
         );
+    }
+
+    #[test]
+    fn enables_cgroup_summary_when_cpu_limit_is_present() {
+        let limits = ResourceLimits {
+            cpu_time_ms: Some(250),
+            wall_time_ms: 1000,
+            memory_bytes: None,
+            max_processes: None,
+        };
+
+        assert!(cgroup_limits_enabled(&limits));
     }
 
     #[test]
