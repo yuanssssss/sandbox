@@ -889,6 +889,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use sandbox_cgroup::{CgroupManager, CgroupPlan};
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{ExecutionStatus, SandboxError};
     use sandbox_testkit::Scenario;
@@ -1755,6 +1756,74 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires writable cgroup v2 support in the test environment"]
+    fn enforces_pids_max_against_fork_attempts() {
+        if !supports_writable_cgroup_v2() {
+            return;
+        }
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/usr/bin/python3", "-c", "import os; import sys; exec(\"try:\\n os.fork()\\n raise SystemExit(1)\\nexcept OSError as err:\\n print(err.errno)\\n raise SystemExit(0 if err.errno == 11 else 2)\")"]
+
+                [limits]
+                wall_time_ms = 1000
+                max_processes = 1
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("cgroup-pids-deny")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "11");
+    }
+
+    #[test]
+    #[ignore = "requires writable cgroup v2 support in the test environment"]
+    fn allows_small_process_tree_within_pids_max_limit() {
+        if !supports_writable_cgroup_v2() {
+            return;
+        }
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/usr/bin/python3", "-c", "import os; exec(\"pid = os.fork()\\nif pid == 0:\\n raise SystemExit(0)\\nended_pid, status = os.waitpid(pid, 0)\\nprint(ended_pid > 0)\\nraise SystemExit(0 if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else 1)\")"]
+
+                [limits]
+                wall_time_ms = 1000
+                max_processes = 4
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("cgroup-pids-allow")),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout.trim(), "True");
+    }
+
     fn unique_artifact_dir(prefix: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1765,5 +1834,17 @@ mod tests {
 
     fn shell_single_quote(path: &Path) -> String {
         format!("'{}'", path.display())
+    }
+
+    fn supports_writable_cgroup_v2() -> bool {
+        let Ok(manager) = CgroupManager::probe_v2_root() else {
+            return false;
+        };
+        let plan = CgroupPlan::new("sandbox-supervisor-cgroup-probe", Default::default());
+        if manager.apply_limits(&plan).is_err() {
+            return false;
+        }
+        let _ = manager.cleanup(&plan);
+        true
     }
 }
