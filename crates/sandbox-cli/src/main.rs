@@ -104,16 +104,8 @@ fn run_command(args: RunArgs) -> Result<()> {
 fn validate_command(args: ValidateArgs) -> Result<()> {
     let config = ExecutionConfig::load(&args.config)
         .with_context(|| format!("failed to load config from {}", args.config.display()))?;
-    let limits = config.resource_limits();
 
-    println!(
-        "config OK\ncommand: {:?}\nwall_time_ms: {}\ncpu_time_ms: {:?}\nmemory_bytes: {:?}\nmax_processes: {:?}",
-        config.process.argv,
-        limits.wall_time_ms,
-        limits.cpu_time_ms,
-        limits.memory_bytes,
-        limits.max_processes
-    );
+    print_validate_summary(&config, &args.config);
     Ok(())
 }
 
@@ -133,6 +125,78 @@ fn print_pretty_result(result: &ExecutionResult) {
     );
     println!("stdout: {}", result.stdout_path.display());
     println!("stderr: {}", result.stderr_path.display());
+}
+
+fn print_validate_summary(config: &ExecutionConfig, config_path: &PathBuf) {
+    let limits = config.resource_limits();
+    let filesystem = &config.filesystem;
+
+    println!("config: ok");
+    println!("config_path: {}", config_path.display());
+    println!("command: {:?}", config.process.argv);
+    println!(
+        "cwd: {}",
+        config
+            .process
+            .cwd
+            .as_ref()
+            .map(|value| value.display().to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    println!("clear_env: {}", config.process.clear_env);
+    println!("env_entries: {}", config.process.env.len());
+    println!("wall_time_ms: {}", limits.wall_time_ms);
+    println!("cpu_time_ms: {}", format_optional_u64(limits.cpu_time_ms));
+    println!("memory_bytes: {}", format_optional_u64(limits.memory_bytes));
+    println!(
+        "max_processes: {}",
+        format_optional_u64(limits.max_processes)
+    );
+    println!(
+        "cgroup_limits_enabled: {}",
+        limits.memory_bytes.is_some() || limits.max_processes.is_some()
+    );
+    println!("seccomp_profile: {:?}", config.security.seccomp_profile);
+    println!("rootfs_enabled: {}", filesystem.enable_rootfs);
+    println!("mount_proc: {}", filesystem.mount_proc);
+    println!("drop_capabilities: {}", filesystem.drop_capabilities);
+    println!("chroot_to_rootfs: {}", filesystem.chroot_to_rootfs);
+    println!("enter_user_namespace: {}", filesystem.enter_user_namespace);
+    println!(
+        "enter_mount_namespace: {}",
+        filesystem.enter_mount_namespace
+    );
+    println!("enter_pid_namespace: {}", filesystem.enter_pid_namespace);
+    println!(
+        "enter_network_namespace: {}",
+        filesystem.enter_network_namespace
+    );
+    println!("enter_ipc_namespace: {}", filesystem.enter_ipc_namespace);
+    println!("apply_mounts: {}", filesystem.apply_mounts);
+    println!("work_dir: {}", filesystem.work_dir.display());
+    println!("tmp_dir: {}", filesystem.tmp_dir.display());
+    println!(
+        "artifact_dir: {}",
+        config
+            .io
+            .artifact_dir
+            .as_ref()
+            .map(|value| value.display().to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    println!(
+        "executable_bind_paths: {}",
+        if filesystem.executable_bind_paths.is_empty() {
+            "[]".to_string()
+        } else {
+            filesystem
+                .executable_bind_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
 }
 
 fn status_label(status: &ExecutionStatus) -> &'static str {
@@ -161,7 +225,10 @@ fn format_optional_i32(value: Option<i32>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_optional_i32, format_optional_u64, status_label};
+    use std::path::PathBuf;
+
+    use super::{format_optional_i32, format_optional_u64, print_validate_summary, status_label};
+    use sandbox_config::ExecutionConfig;
     use sandbox_core::ExecutionStatus;
 
     #[test]
@@ -181,5 +248,35 @@ mod tests {
             status_label(&ExecutionStatus::WallTimeLimitExceeded),
             "wall_time_limit_exceeded"
         );
+    }
+
+    #[test]
+    fn validate_summary_covers_security_and_cgroup_flags() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 4096
+                max_processes = 8
+
+                [security]
+                seccomp_profile = "compat"
+
+                [filesystem]
+                enable_rootfs = true
+                enter_user_namespace = true
+                enter_mount_namespace = true
+                enter_pid_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                mount_proc = true
+            "#,
+        )
+        .expect("config should parse");
+
+        print_validate_summary(&config, &PathBuf::from("configs/test.toml"));
     }
 }
