@@ -137,6 +137,14 @@ pub struct FilesystemConfig {
     pub apply_mounts: bool,
     #[serde(default = "default_chroot_to_rootfs")]
     pub chroot_to_rootfs: bool,
+    #[serde(default = "default_inside_uid")]
+    pub inside_uid: u32,
+    #[serde(default = "default_inside_gid")]
+    pub inside_gid: u32,
+    pub outside_uid: Option<u32>,
+    pub outside_gid: Option<u32>,
+    #[serde(default = "default_deny_setgroups")]
+    pub deny_setgroups: bool,
     #[serde(default = "default_work_dir")]
     pub work_dir: PathBuf,
     #[serde(default = "default_tmp_dir")]
@@ -161,6 +169,11 @@ impl Default for FilesystemConfig {
             enter_ipc_namespace: default_enter_ipc_namespace(),
             apply_mounts: default_apply_mounts(),
             chroot_to_rootfs: default_chroot_to_rootfs(),
+            inside_uid: default_inside_uid(),
+            inside_gid: default_inside_gid(),
+            outside_uid: None,
+            outside_gid: None,
+            deny_setgroups: default_deny_setgroups(),
             work_dir: default_work_dir(),
             tmp_dir: default_tmp_dir(),
             runtime_bind_paths: default_runtime_bind_paths(),
@@ -203,6 +216,17 @@ impl FilesystemConfig {
         if self.chroot_to_rootfs && !self.apply_mounts {
             return Err(SandboxError::config(
                 "filesystem.chroot_to_rootfs requires filesystem.apply_mounts = true",
+            ));
+        }
+        if !self.enter_user_namespace
+            && (self.outside_uid.is_some()
+                || self.outside_gid.is_some()
+                || self.inside_uid != 0
+                || self.inside_gid != 0
+                || !self.deny_setgroups)
+        {
+            return Err(SandboxError::config(
+                "user namespace identity mapping options require filesystem.enter_user_namespace = true",
             ));
         }
 
@@ -291,6 +315,18 @@ const fn default_chroot_to_rootfs() -> bool {
     false
 }
 
+const fn default_inside_uid() -> u32 {
+    0
+}
+
+const fn default_inside_gid() -> u32 {
+    0
+}
+
+const fn default_deny_setgroups() -> bool {
+    true
+}
+
 fn default_work_dir() -> PathBuf {
     PathBuf::from("/work")
 }
@@ -359,6 +395,11 @@ mod tests {
         assert!(!config.filesystem.enter_ipc_namespace);
         assert!(!config.filesystem.apply_mounts);
         assert!(!config.filesystem.chroot_to_rootfs);
+        assert_eq!(config.filesystem.inside_uid, 0);
+        assert_eq!(config.filesystem.inside_gid, 0);
+        assert_eq!(config.filesystem.outside_uid, None);
+        assert_eq!(config.filesystem.outside_gid, None);
+        assert!(config.filesystem.deny_setgroups);
         assert_eq!(config.filesystem.work_dir, PathBuf::from("/work"));
         assert_eq!(config.filesystem.tmp_dir, PathBuf::from("/tmp"));
         assert!(config.filesystem.mount_proc);
@@ -420,6 +461,20 @@ mod tests {
 
         let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
         assert!(err.to_string().contains("enter_user_namespace"));
+    }
+
+    #[test]
+    fn rejects_user_mapping_without_user_namespace() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            outside_uid = 1000
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("identity mapping"));
     }
 
     #[test]

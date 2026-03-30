@@ -94,13 +94,27 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
         let filesystem = config.filesystem.clone();
         let artifact_dir = artifact_dir.clone();
         let rootfs_cwd = rootfs_cwd.clone();
+        let outside_uid = libc::geteuid() as u32;
+        let outside_gid = libc::getegid() as u32;
         process.pre_exec(move || {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             if filesystem.enter_user_namespace {
-                enter_user_namespace()?;
-                drop_capabilities()?;
+                enter_user_namespace(&filesystem, outside_uid, outside_gid).map_err(|err| {
+                    let _ = fs::write(
+                        artifact_dir.join("rootfs-preexec-error.log"),
+                        format!("enter_user_namespace failed: {err}"),
+                    );
+                    err
+                })?;
+                drop_capabilities().map_err(|err| {
+                    let _ = fs::write(
+                        artifact_dir.join("rootfs-preexec-error.log"),
+                        format!("drop_capabilities failed: {err}"),
+                    );
+                    err
+                })?;
             }
             if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
                 enter_optional_namespaces(&filesystem)?;
@@ -368,13 +382,37 @@ fn namespace_name(flag: libc::c_int) -> &'static str {
     }
 }
 
-fn enter_user_namespace() -> std::io::Result<()> {
+fn enter_user_namespace(
+    filesystem: &sandbox_config::FilesystemConfig,
+    outside_uid: u32,
+    outside_gid: u32,
+) -> std::io::Result<()> {
     let result = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
     if result == -1 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+        return Err(std::io::Error::last_os_error());
     }
+
+    configure_user_namespace_identity(filesystem, outside_uid, outside_gid)?;
+
+    let setgid_result = unsafe { libc::setgid(filesystem.inside_gid) };
+    if setgid_result == -1 {
+        return Err(std::io::Error::other(format!(
+            "setgid({}) failed: {}",
+            filesystem.inside_gid,
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let setuid_result = unsafe { libc::setuid(filesystem.inside_uid) };
+    if setuid_result == -1 {
+        return Err(std::io::Error::other(format!(
+            "setuid({}) failed: {}",
+            filesystem.inside_uid,
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    Ok(())
 }
 
 fn drop_capabilities() -> std::io::Result<()> {
@@ -387,6 +425,54 @@ fn drop_capabilities() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+fn configure_user_namespace_identity(
+    filesystem: &sandbox_config::FilesystemConfig,
+    parent_outside_uid: u32,
+    parent_outside_gid: u32,
+) -> std::io::Result<()> {
+    let outside_uid = filesystem.outside_uid.unwrap_or(parent_outside_uid);
+    let outside_gid = filesystem.outside_gid.unwrap_or(parent_outside_gid);
+
+    if filesystem.deny_setgroups {
+        fs::write("/proc/self/setgroups", "deny")
+            .or_else(ignore_missing_setgroups_file)
+            .map_err(|err| {
+                std::io::Error::other(format!("writing /proc/self/setgroups failed: {err}"))
+            })?;
+    }
+
+    fs::write(
+        "/proc/self/uid_map",
+        format!("{} {} 1\n", filesystem.inside_uid, outside_uid),
+    )
+    .map_err(|err| {
+        std::io::Error::other(format!(
+            "writing /proc/self/uid_map failed for inside={} outside={}: {err}",
+            filesystem.inside_uid, outside_uid
+        ))
+    })?;
+    fs::write(
+        "/proc/self/gid_map",
+        format!("{} {} 1\n", filesystem.inside_gid, outside_gid),
+    )
+    .map_err(|err| {
+        std::io::Error::other(format!(
+            "writing /proc/self/gid_map failed for inside={} outside={}: {err}",
+            filesystem.inside_gid, outside_gid
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn ignore_missing_setgroups_file(err: std::io::Error) -> std::io::Result<()> {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 fn enter_optional_namespaces(filesystem: &sandbox_config::FilesystemConfig) -> std::io::Result<()> {
@@ -1101,6 +1187,49 @@ mod tests {
         .expect("command should run");
 
         assert_eq!(result.status, ExecutionStatus::Ok);
+    }
+
+    #[test]
+    #[ignore = "requires user namespace support in the test environment"]
+    fn applies_user_namespace_uid_gid_mapping() {
+        let support = probe_namespace_support();
+        if !support.user_namespace {
+            return;
+        }
+
+        let artifact_dir = unique_artifact_dir("userns-mapping");
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "id -u && id -g"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_user_namespace = true
+                inside_uid = 0
+                inside_gid = 0
+                executable_bind_paths = ["/bin", "/usr/bin"]
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("0"));
+        assert_eq!(lines.next(), Some("0"));
     }
 
     fn unique_artifact_dir(prefix: &str) -> PathBuf {
