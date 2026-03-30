@@ -127,6 +127,10 @@ pub struct FilesystemConfig {
     pub enter_mount_namespace: bool,
     #[serde(default = "default_enter_pid_namespace")]
     pub enter_pid_namespace: bool,
+    #[serde(default = "default_enter_network_namespace")]
+    pub enter_network_namespace: bool,
+    #[serde(default = "default_enter_ipc_namespace")]
+    pub enter_ipc_namespace: bool,
     #[serde(default = "default_apply_mounts")]
     pub apply_mounts: bool,
     #[serde(default = "default_chroot_to_rootfs")]
@@ -150,6 +154,8 @@ impl Default for FilesystemConfig {
             rootfs_dir: None,
             enter_mount_namespace: default_enter_mount_namespace(),
             enter_pid_namespace: default_enter_pid_namespace(),
+            enter_network_namespace: default_enter_network_namespace(),
+            enter_ipc_namespace: default_enter_ipc_namespace(),
             apply_mounts: default_apply_mounts(),
             chroot_to_rootfs: default_chroot_to_rootfs(),
             work_dir: default_work_dir(),
@@ -174,6 +180,16 @@ impl FilesystemConfig {
         if self.enter_pid_namespace && !self.enter_mount_namespace {
             return Err(SandboxError::config(
                 "filesystem.enter_pid_namespace requires filesystem.enter_mount_namespace = true",
+            ));
+        }
+        if self.enter_network_namespace && !self.enter_mount_namespace {
+            return Err(SandboxError::config(
+                "filesystem.enter_network_namespace requires filesystem.enter_mount_namespace = true",
+            ));
+        }
+        if self.enter_ipc_namespace && !self.enter_mount_namespace {
+            return Err(SandboxError::config(
+                "filesystem.enter_ipc_namespace requires filesystem.enter_mount_namespace = true",
             ));
         }
         if self.chroot_to_rootfs && !self.apply_mounts {
@@ -244,6 +260,14 @@ const fn default_enter_mount_namespace() -> bool {
 }
 
 const fn default_enter_pid_namespace() -> bool {
+    false
+}
+
+const fn default_enter_network_namespace() -> bool {
+    false
+}
+
+const fn default_enter_ipc_namespace() -> bool {
     false
 }
 
@@ -318,6 +342,8 @@ mod tests {
         assert!(config.filesystem.enable_rootfs);
         assert!(!config.filesystem.enter_mount_namespace);
         assert!(!config.filesystem.enter_pid_namespace);
+        assert!(!config.filesystem.enter_network_namespace);
+        assert!(!config.filesystem.enter_ipc_namespace);
         assert!(!config.filesystem.apply_mounts);
         assert!(!config.filesystem.chroot_to_rootfs);
         assert_eq!(config.filesystem.work_dir, PathBuf::from("/work"));
@@ -377,6 +403,34 @@ mod tests {
 
             [filesystem]
             enter_pid_namespace = true
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("enter_mount_namespace"));
+    }
+
+    #[test]
+    fn rejects_network_namespace_without_mount_namespace() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            enter_network_namespace = true
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("enter_mount_namespace"));
+    }
+
+    #[test]
+    fn rejects_ipc_namespace_without_mount_namespace() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            enter_ipc_namespace = true
         "#;
 
         let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");

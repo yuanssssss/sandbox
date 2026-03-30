@@ -99,6 +99,7 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
                 return Err(std::io::Error::last_os_error());
             }
             if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
+                enter_optional_namespaces(&filesystem)?;
                 let runtime = setup_rootfs(&filesystem, &artifact_dir, rootfs_cwd.as_deref())
                     .map_err(|err| {
                         let _ = fs::write(
@@ -180,6 +181,22 @@ fn ensure_namespace_support(config: &ExecutionConfig) -> Result<()> {
                 .unwrap_or_else(|| "unknown pid namespace error".to_string()),
         ));
     }
+    if config.filesystem.enter_network_namespace && !support.network_namespace {
+        return Err(SandboxError::capability_unavailable(
+            "network_namespace",
+            support
+                .network_reason
+                .unwrap_or_else(|| "unknown network namespace error".to_string()),
+        ));
+    }
+    if config.filesystem.enter_ipc_namespace && !support.ipc_namespace {
+        return Err(SandboxError::capability_unavailable(
+            "ipc_namespace",
+            support
+                .ipc_reason
+                .unwrap_or_else(|| "unknown ipc namespace error".to_string()),
+        ));
+    }
 
     Ok(())
 }
@@ -190,14 +207,27 @@ struct NamespaceSupport {
     mount_reason: Option<String>,
     pid_namespace: bool,
     pid_reason: Option<String>,
+    network_namespace: bool,
+    network_reason: Option<String>,
+    ipc_namespace: bool,
+    ipc_reason: Option<String>,
 }
 
 fn probe_namespace_support() -> NamespaceSupport {
+    let mount_probe = probe_unshare_support(libc::CLONE_NEWNS);
+    let pid_probe = probe_unshare_support(libc::CLONE_NEWPID);
+    let network_probe = probe_unshare_support(libc::CLONE_NEWNET);
+    let ipc_probe = probe_unshare_support(libc::CLONE_NEWIPC);
+
     NamespaceSupport {
-        mount_namespace: probe_unshare_support(libc::CLONE_NEWNS).is_ok(),
-        mount_reason: probe_unshare_support(libc::CLONE_NEWNS).err(),
-        pid_namespace: probe_unshare_support(libc::CLONE_NEWPID).is_ok(),
-        pid_reason: probe_unshare_support(libc::CLONE_NEWPID).err(),
+        mount_namespace: mount_probe.is_ok(),
+        mount_reason: mount_probe.err(),
+        pid_namespace: pid_probe.is_ok(),
+        pid_reason: pid_probe.err(),
+        network_namespace: network_probe.is_ok(),
+        network_reason: network_probe.err(),
+        ipc_namespace: ipc_probe.is_ok(),
+        ipc_reason: ipc_probe.err(),
     }
 }
 
@@ -314,7 +344,29 @@ fn namespace_name(flag: libc::c_int) -> &'static str {
     match flag {
         libc::CLONE_NEWNS => "mount namespace probe",
         libc::CLONE_NEWPID => "pid namespace probe",
+        libc::CLONE_NEWNET => "network namespace probe",
+        libc::CLONE_NEWIPC => "ipc namespace probe",
         _ => "namespace probe",
+    }
+}
+
+fn enter_optional_namespaces(filesystem: &sandbox_config::FilesystemConfig) -> std::io::Result<()> {
+    if filesystem.enter_network_namespace {
+        enter_single_namespace(libc::CLONE_NEWNET)?;
+    }
+    if filesystem.enter_ipc_namespace {
+        enter_single_namespace(libc::CLONE_NEWIPC)?;
+    }
+
+    Ok(())
+}
+
+fn enter_single_namespace(flag: libc::c_int) -> std::io::Result<()> {
+    let result = unsafe { libc::unshare(flag) };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -633,9 +685,84 @@ mod tests {
     }
 
     #[test]
+    fn reports_capability_error_when_network_namespace_is_unavailable() {
+        let support = probe_namespace_support();
+        if !support.mount_namespace || support.network_namespace {
+            return;
+        }
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [filesystem]
+                enable_rootfs = true
+                enter_mount_namespace = true
+                enter_network_namespace = true
+            "#,
+        )
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("unsupported-network")),
+            },
+        )
+        .expect_err("run should fail");
+
+        match err {
+            SandboxError::CapabilityUnavailable { capability, .. } => {
+                assert_eq!(capability, "network_namespace");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn reports_capability_error_when_ipc_namespace_is_unavailable() {
+        let support = probe_namespace_support();
+        if !support.mount_namespace || support.ipc_namespace {
+            return;
+        }
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [filesystem]
+                enable_rootfs = true
+                enter_mount_namespace = true
+                enter_ipc_namespace = true
+            "#,
+        )
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("unsupported-ipc")),
+            },
+        )
+        .expect_err("run should fail");
+
+        match err {
+            SandboxError::CapabilityUnavailable { capability, .. } => {
+                assert_eq!(capability, "ipc_namespace");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
     #[ignore = "requires mount namespace and chroot privileges in the test environment"]
     fn can_write_inside_sandbox_workdir_when_mounts_are_enabled() {
-        if !probe_namespace_support().mount_namespace || !probe_namespace_support().pid_namespace {
+        let support = probe_namespace_support();
+        if !support.mount_namespace || !support.pid_namespace {
             return;
         }
         let artifact_dir = unique_artifact_dir("workdir-probe");
@@ -677,7 +804,8 @@ mod tests {
     #[test]
     #[ignore = "requires mount namespace and chroot privileges in the test environment"]
     fn hides_host_file_after_chroot() {
-        if !probe_namespace_support().mount_namespace || !probe_namespace_support().pid_namespace {
+        let support = probe_namespace_support();
+        if !support.mount_namespace || !support.pid_namespace {
             return;
         }
         let artifact_dir = unique_artifact_dir("host-visibility");
@@ -721,7 +849,8 @@ mod tests {
     #[test]
     #[ignore = "requires mount namespace and chroot privileges in the test environment"]
     fn mounts_minimal_proc_inside_rootfs() {
-        if !probe_namespace_support().mount_namespace || !probe_namespace_support().pid_namespace {
+        let support = probe_namespace_support();
+        if !support.mount_namespace || !support.pid_namespace {
             return;
         }
         let artifact_dir = unique_artifact_dir("proc-visibility");
@@ -745,6 +874,94 @@ mod tests {
                 executable_bind_paths = ["/bin", "/usr/bin"]
             "#,
             script = Scenario::ProcVisibilityProbe.shell_snippet()
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+    }
+
+    #[test]
+    #[ignore = "requires mount, pid, network, and chroot privileges in the test environment"]
+    fn isolates_network_namespace_view() {
+        let support = probe_namespace_support();
+        if !support.mount_namespace || !support.pid_namespace || !support.network_namespace {
+            return;
+        }
+        let artifact_dir = unique_artifact_dir("network-isolation");
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "{script}"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_mount_namespace = true
+                enter_pid_namespace = true
+                enter_network_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                work_dir = "/work"
+                tmp_dir = "/tmp"
+                mount_proc = true
+                executable_bind_paths = ["/bin", "/usr/bin"]
+            "#,
+            script = Scenario::NetworkIsolationProbe.shell_snippet()
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+    }
+
+    #[test]
+    #[ignore = "requires mount, pid, ipc, and chroot privileges in the test environment"]
+    fn isolates_ipc_namespace_view() {
+        let support = probe_namespace_support();
+        if !support.mount_namespace || !support.pid_namespace || !support.ipc_namespace {
+            return;
+        }
+        let artifact_dir = unique_artifact_dir("ipc-isolation");
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "{script}"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_mount_namespace = true
+                enter_pid_namespace = true
+                enter_ipc_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                work_dir = "/work"
+                tmp_dir = "/tmp"
+                mount_proc = true
+                executable_bind_paths = ["/bin", "/usr/bin"]
+            "#,
+            script = Scenario::IpcIsolationProbe.shell_snippet()
         ))
         .expect("config should parse");
 

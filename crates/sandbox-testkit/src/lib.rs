@@ -6,6 +6,8 @@ pub enum Scenario {
     WorkDirWriteProbe,
     HostVisibilityProbe,
     ProcVisibilityProbe,
+    NetworkIsolationProbe,
+    IpcIsolationProbe,
 }
 
 impl Scenario {
@@ -17,6 +19,8 @@ impl Scenario {
             Self::WorkDirWriteProbe => "pwd && touch /work/probe.txt && test -f /work/probe.txt",
             Self::HostVisibilityProbe => "test ! -e /host-secret.txt",
             Self::ProcVisibilityProbe => "test -d /proc && test -r /proc/self/status",
+            Self::NetworkIsolationProbe => "test ! -e /proc/net/dev",
+            Self::IpcIsolationProbe => "test -w /proc/sysvipc || test ! -e /proc/sysvipc",
         }
     }
 }
