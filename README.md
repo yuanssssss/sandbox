@@ -44,7 +44,11 @@
   - `compat` profile 比 `default` 更宽松，保留 `ptrace`
   - `strict` profile 在 `default` 基础上进一步阻止网络 socket 创建
   - 已补 `sh` / `python3` 在 `default`、`compat`、`strict` 下的兼容性回归，避免误伤常见运行时
-  - 已支持把宿主机输入以 `filesystem.readonly_bind_paths` 只读挂入沙箱，并把 `filesystem.output_dir` 映射到 artifact 下的受控可写目录
+  - 已支持把宿主机输入以 `filesystem.readonly_bind_paths` 只读挂到沙箱内的 `/inputs/<basename>`，并把 `filesystem.output_dir` 映射到 artifact 下的受控可写目录
+- `M5` 审计日志：
+  - 已通过 `tracing` 输出 `sandbox_audit` 结构化事件，覆盖 `run_start`、`rootfs_prepared`、`cgroup_prepared`、`payload_spawned`、`termination_reason`、`cgroup_finalized`、`run_finished`
+  - 已加固异常清理路径：setup/spawn/wait 异常后会清理 cgroup，并终止已启动的 payload 进程组
+  - CLI 已补用户可见错误报告：可区分配置问题、能力缺失、I/O/setup 失败与 payload 运行失败，并给出建议排查方向
 
 ## Workspace 结构
 

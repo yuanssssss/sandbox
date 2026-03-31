@@ -270,6 +270,7 @@ dependencies = [
  "sandbox-config",
  "sandbox-core",
  "sandbox-supervisor",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
@@ -332,6 +333,7 @@ dependencies = [
  "sandbox-seccomp",
  "sandbox-testkit",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

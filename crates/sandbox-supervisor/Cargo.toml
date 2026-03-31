@@ -16,3 +16,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 sandbox-testkit = { path = "../sandbox-testkit" }
+tracing-subscriber.workspace = true

@@ -44,6 +44,18 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
         .clone()
         .or_else(|| config.io.artifact_dir.clone())
         .unwrap_or_else(default_artifact_dir);
+    info!(
+        target: "sandbox_audit",
+        audit_stage = "run_start",
+        command = ?command,
+        artifact_dir = %artifact_dir.display(),
+        wall_time_ms = config.limits.wall_time_ms,
+        cpu_time_ms = config.limits.cpu_time_ms,
+        memory_bytes = config.limits.memory_bytes,
+        max_processes = config.limits.max_processes,
+        seccomp_profile = ?config.security.seccomp_profile,
+        "sandbox audit"
+    );
     fs::create_dir_all(&artifact_dir)
         .map_err(|err| SandboxError::io("creating artifact directory", err))?;
 
@@ -54,211 +66,264 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
             mounts = rootfs_plan.mount_count(),
             "prepared rootfs scaffold"
         );
+        info!(
+            target: "sandbox_audit",
+            audit_stage = "rootfs_prepared",
+            root = %rootfs_plan.layout.root.display(),
+            mount_count = rootfs_plan.mount_count(),
+            work_dir = %rootfs_plan.layout.sandbox_work_dir.display(),
+            tmp_dir = %rootfs_plan.layout.sandbox_tmp_dir.display(),
+            output_dir = ?rootfs_plan.layout.sandbox_output_dir,
+            "sandbox audit"
+        );
     }
 
     ensure_namespace_support(&config)?;
 
-    let cgroup_binding = prepare_cgroup_context(config, &artifact_dir, options)?;
+    let mut cgroup_binding = prepare_cgroup_context(config, &artifact_dir, options)?;
 
-    let stdout_path = resolve_output_path(
-        &artifact_dir,
-        config.io.stdout_path.as_deref(),
-        "stdout.log",
-    );
-    let stderr_path = resolve_output_path(
-        &artifact_dir,
-        config.io.stderr_path.as_deref(),
-        "stderr.log",
-    );
-    assert_path_is_within(&artifact_dir, &stdout_path)?;
-    assert_path_is_within(&artifact_dir, &stderr_path)?;
-    create_parent_dir(&stdout_path)?;
-    create_parent_dir(&stderr_path)?;
+    let result = (|| -> Result<ExecutionResult> {
+        let stdout_path = resolve_output_path(
+            &artifact_dir,
+            config.io.stdout_path.as_deref(),
+            "stdout.log",
+        );
+        let stderr_path = resolve_output_path(
+            &artifact_dir,
+            config.io.stderr_path.as_deref(),
+            "stderr.log",
+        );
+        assert_path_is_within(&artifact_dir, &stdout_path)?;
+        assert_path_is_within(&artifact_dir, &stderr_path)?;
+        create_parent_dir(&stdout_path)?;
+        create_parent_dir(&stderr_path)?;
 
-    let stdout = File::create(&stdout_path)
-        .map_err(|err| SandboxError::io("opening stdout output file", err))?;
-    let stderr = File::create(&stderr_path)
-        .map_err(|err| SandboxError::io("opening stderr output file", err))?;
-    let stdin = open_stdin(config.io.stdin_path.as_deref())?;
+        let stdout = File::create(&stdout_path)
+            .map_err(|err| SandboxError::io("opening stdout output file", err))?;
+        let stderr = File::create(&stderr_path)
+            .map_err(|err| SandboxError::io("opening stderr output file", err))?;
+        let stdin = open_stdin(config.io.stdin_path.as_deref())?;
 
-    let mut process = Command::new(&command[0]);
-    process.args(&command[1..]);
-    process.stdin(stdin);
-    process.stdout(Stdio::from(stdout));
-    process.stderr(Stdio::from(stderr));
+        let mut process = Command::new(&command[0]);
+        process.args(&command[1..]);
+        process.stdin(stdin);
+        process.stdout(Stdio::from(stdout));
+        process.stderr(Stdio::from(stderr));
 
-    let rootfs_cwd = rootfs_cwd(config);
-    if !config.filesystem.chroot_to_rootfs {
-        if let Some(cwd) = &config.process.cwd {
-            process.current_dir(cwd);
+        let rootfs_cwd = rootfs_cwd(config);
+        if !config.filesystem.chroot_to_rootfs {
+            if let Some(cwd) = &config.process.cwd {
+                process.current_dir(cwd);
+            }
         }
-    }
-    if config.process.clear_env {
-        process.env_clear();
-    }
-    for (key, value) in config.parsed_env()? {
-        process.env(key, value);
-    }
+        if config.process.clear_env {
+            process.env_clear();
+        }
+        for (key, value) in config.parsed_env()? {
+            process.env(key, value);
+        }
 
-    unsafe {
-        let filesystem = config.filesystem.clone();
-        let security = config.security.clone();
-        let artifact_dir = artifact_dir.clone();
-        let rootfs_cwd = rootfs_cwd.clone();
-        let outside_uid = libc::geteuid() as u32;
-        let outside_gid = libc::getegid() as u32;
-        process.pre_exec(move || {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if filesystem.enter_user_namespace {
-                enter_user_namespace(&filesystem, outside_uid, outside_gid).map_err(|err| {
-                    let _ = fs::write(
-                        artifact_dir.join("rootfs-preexec-error.log"),
-                        format!("enter_user_namespace failed: {err}"),
-                    );
-                    err
-                })?;
-            }
-            if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
-                enter_optional_namespaces(&filesystem).map_err(|err| {
-                    let _ = fs::write(
-                        artifact_dir.join("rootfs-preexec-error.log"),
-                        format!("enter_optional_namespaces failed: {err}"),
-                    );
-                    err
-                })?;
-                let plan = prepare_rootfs(&filesystem, &artifact_dir).map_err(|err| {
-                    let _ = fs::write(
-                        artifact_dir.join("rootfs-preexec-error.log"),
-                        err.to_string(),
-                    );
-                    std::io::Error::other(err)
-                })?;
-                enter_mount_namespace().map_err(|err| {
-                    let _ = fs::write(
-                        artifact_dir.join("rootfs-preexec-error.log"),
-                        err.to_string(),
-                    );
-                    std::io::Error::other(err)
-                })?;
-                if filesystem.apply_mounts {
-                    apply_rootfs(&plan, !filesystem.enter_pid_namespace).map_err(|err| {
-                        let _ = fs::write(
-                            artifact_dir.join("rootfs-preexec-error.log"),
-                            err.to_string(),
-                        );
-                        std::io::Error::other(err)
-                    })?;
+        unsafe {
+            let filesystem = config.filesystem.clone();
+            let security = config.security.clone();
+            let artifact_dir = artifact_dir.clone();
+            let rootfs_cwd = rootfs_cwd.clone();
+            let outside_uid = libc::geteuid() as u32;
+            let outside_gid = libc::getegid() as u32;
+            process.pre_exec(move || {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
                 }
-                if filesystem.enter_pid_namespace {
-                    enter_pid_namespace_for_exec(
-                        filesystem.mount_proc.then_some(&plan),
-                        &artifact_dir,
-                    )
-                    .map_err(|err| {
+                if filesystem.enter_user_namespace {
+                    enter_user_namespace(&filesystem, outside_uid, outside_gid).map_err(|err| {
                         let _ = fs::write(
                             artifact_dir.join("rootfs-preexec-error.log"),
-                            format!("enter_pid_namespace_for_exec failed: {err}"),
+                            format!("enter_user_namespace failed: {err}"),
                         );
                         err
                     })?;
                 }
-                if filesystem.chroot_to_rootfs {
-                    chroot_into_rootfs(&plan, rootfs_cwd.as_deref()).map_err(|err| {
+                if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
+                    enter_optional_namespaces(&filesystem).map_err(|err| {
+                        let _ = fs::write(
+                            artifact_dir.join("rootfs-preexec-error.log"),
+                            format!("enter_optional_namespaces failed: {err}"),
+                        );
+                        err
+                    })?;
+                    let plan = prepare_rootfs(&filesystem, &artifact_dir).map_err(|err| {
                         let _ = fs::write(
                             artifact_dir.join("rootfs-preexec-error.log"),
                             err.to_string(),
                         );
                         std::io::Error::other(err)
                     })?;
+                    enter_mount_namespace().map_err(|err| {
+                        let _ = fs::write(
+                            artifact_dir.join("rootfs-preexec-error.log"),
+                            err.to_string(),
+                        );
+                        std::io::Error::other(err)
+                    })?;
+                    if filesystem.apply_mounts {
+                        apply_rootfs(&plan, !filesystem.enter_pid_namespace).map_err(|err| {
+                            let _ = fs::write(
+                                artifact_dir.join("rootfs-preexec-error.log"),
+                                err.to_string(),
+                            );
+                            std::io::Error::other(err)
+                        })?;
+                    }
+                    if filesystem.enter_pid_namespace {
+                        enter_pid_namespace_for_exec(
+                            filesystem.mount_proc.then_some(&plan),
+                            &artifact_dir,
+                        )
+                        .map_err(|err| {
+                            let _ = fs::write(
+                                artifact_dir.join("rootfs-preexec-error.log"),
+                                format!("enter_pid_namespace_for_exec failed: {err}"),
+                            );
+                            err
+                        })?;
+                    }
+                    if filesystem.chroot_to_rootfs {
+                        chroot_into_rootfs(&plan, rootfs_cwd.as_deref()).map_err(|err| {
+                            let _ = fs::write(
+                                artifact_dir.join("rootfs-preexec-error.log"),
+                                err.to_string(),
+                            );
+                            std::io::Error::other(err)
+                        })?;
+                    }
                 }
-            }
-            if filesystem.enter_user_namespace && filesystem.drop_capabilities {
-                drop_capabilities().map_err(|err| {
+                if filesystem.enter_user_namespace && filesystem.drop_capabilities {
+                    drop_capabilities().map_err(|err| {
+                        let _ = fs::write(
+                            artifact_dir.join("rootfs-preexec-error.log"),
+                            format!("drop_capabilities failed: {err}"),
+                        );
+                        err
+                    })?;
+                }
+                install_seccomp(security.seccomp_profile).map_err(|err| {
+                    let io_err = std::io::Error::other(err.to_string());
                     let _ = fs::write(
                         artifact_dir.join("rootfs-preexec-error.log"),
-                        format!("drop_capabilities failed: {err}"),
+                        format!("install_seccomp failed: {err}"),
                     );
+                    io_err
+                })?;
+                Ok(())
+            });
+        }
+
+        info!(
+            target: "sandbox_audit",
+            audit_stage = "seccomp_configured",
+            seccomp_profile = ?config.security.seccomp_profile,
+            "sandbox audit"
+        );
+        info!(
+            command = ?command,
+            artifact_dir = %artifact_dir.display(),
+            "spawning sandbox payload"
+        );
+        let preexec_log = artifact_dir.join("rootfs-preexec-error.log");
+        let _ = fs::remove_file(&preexec_log);
+        let mut child = process.spawn().map_err(|err| {
+            let detail = fs::read_to_string(&preexec_log)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| err.to_string());
+            SandboxError::Spawn(detail)
+        })?;
+        info!(
+            target: "sandbox_audit",
+            audit_stage = "payload_spawned",
+            pid = child.id(),
+            stdout_path = %stdout_path.display(),
+            stderr_path = %stderr_path.display(),
+            "sandbox audit"
+        );
+        if let Some(binding) = &cgroup_binding {
+            binding
+                .manager
+                .attach_pid(&binding.plan, child.id())
+                .map_err(|err| {
+                    cleanup_child_process_group(&mut child);
                     err
                 })?;
-            }
-            install_seccomp(security.seccomp_profile).map_err(|err| {
-                let io_err = std::io::Error::other(err.to_string());
-                let _ = fs::write(
-                    artifact_dir.join("rootfs-preexec-error.log"),
-                    format!("install_seccomp failed: {err}"),
-                );
-                io_err
-            })?;
-            Ok(())
-        });
-    }
+        }
+        let wall_limit = Duration::from_millis(config.limits.wall_time_ms);
+        let wait_outcome = wait_for_exit(
+            &mut child,
+            wall_limit,
+            config.limits.cpu_time_ms,
+            cgroup_binding.as_ref(),
+        )
+        .map_err(|err| {
+            cleanup_child_process_group(&mut child);
+            err
+        })?;
 
-    info!(command = ?command, artifact_dir = %artifact_dir.display(), "spawning sandbox payload");
-    let preexec_log = artifact_dir.join("rootfs-preexec-error.log");
-    let _ = fs::remove_file(&preexec_log);
-    let mut child = process.spawn().map_err(|err| {
-        let detail = fs::read_to_string(&preexec_log)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| err.to_string());
-        SandboxError::Spawn(detail)
-    })?;
-    if let Some(binding) = &cgroup_binding {
-        binding
-            .manager
-            .attach_pid(&binding.plan, child.id())
-            .map_err(|err| {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = binding.manager.cleanup(&binding.plan);
-                err
-            })?;
-    }
-    let wall_limit = Duration::from_millis(config.limits.wall_time_ms);
-    let wait_outcome = wait_for_exit(
-        &mut child,
-        wall_limit,
-        config.limits.cpu_time_ms,
-        cgroup_binding.as_ref(),
-    )?;
-
-    let finalized_cgroup = finalize_cgroup(
-        cgroup_binding.as_ref(),
-        wait_outcome.elapsed,
-        config.limits.cpu_time_ms,
-    )?;
-    let status = classify_status(
-        wait_outcome.timed_out,
-        wait_outcome.cpu_timed_out
-            || finalized_cgroup
+        let finalized_cgroup = {
+            let result = finalize_cgroup(
+                cgroup_binding.as_ref(),
+                wait_outcome.elapsed,
+                config.limits.cpu_time_ms,
+            );
+            cgroup_binding = None;
+            result?
+        };
+        let status = classify_status(
+            wait_outcome.timed_out,
+            wait_outcome.cpu_timed_out
+                || finalized_cgroup
+                    .as_ref()
+                    .is_some_and(|value| value.cpu_limit_exceeded),
+            &wait_outcome.exit_status,
+            finalized_cgroup
                 .as_ref()
-                .is_some_and(|value| value.cpu_limit_exceeded),
-        &wait_outcome.exit_status,
-        finalized_cgroup
-            .as_ref()
-            .is_some_and(|value| value.memory_limit_exceeded),
-    );
-    let term_signal = wait_outcome.exit_status.signal();
-    let exit_code = wait_outcome.exit_status.code();
-    let usage = finalized_cgroup
-        .map(|value| value.usage)
-        .unwrap_or_else(|| ResourceUsage {
-            cpu_time_ms: None,
-            wall_time_ms: wait_outcome.elapsed.as_millis() as u64,
-            memory_peak_bytes: None,
-        });
+                .is_some_and(|value| value.memory_limit_exceeded),
+        );
+        let term_signal = wait_outcome.exit_status.signal();
+        let exit_code = wait_outcome.exit_status.code();
+        let usage = finalized_cgroup
+            .map(|value| value.usage)
+            .unwrap_or_else(|| ResourceUsage {
+                cpu_time_ms: None,
+                wall_time_ms: wait_outcome.elapsed.as_millis() as u64,
+                memory_peak_bytes: None,
+            });
+        info!(
+            target: "sandbox_audit",
+            audit_stage = "run_finished",
+            status = ?status,
+            exit_code,
+            term_signal,
+            wall_time_ms = usage.wall_time_ms,
+            cpu_time_ms = usage.cpu_time_ms,
+            memory_peak_bytes = usage.memory_peak_bytes,
+            "sandbox audit"
+        );
 
-    Ok(ExecutionResult {
-        command,
-        exit_code,
-        term_signal,
-        usage,
-        stdout_path,
-        stderr_path,
-        status,
-    })
+        Ok(ExecutionResult {
+            command,
+            exit_code,
+            term_signal,
+            usage,
+            stdout_path,
+            stderr_path,
+            status,
+        })
+    })();
+
+    if let Some(binding) = cgroup_binding.take() {
+        cleanup_cgroup_after_error(&binding);
+    }
+
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +354,16 @@ fn prepare_cgroup_context(
     };
     let plan = CgroupPlan::new(cgroup_scope_name(artifact_dir), config.resource_limits());
     manager.apply_limits(&plan)?;
+    let cgroup_path = plan.path_under(manager.root());
+    info!(
+        target: "sandbox_audit",
+        audit_stage = "cgroup_prepared",
+        cgroup_path = %cgroup_path.display(),
+        cpu_time_ms = plan.limits.cpu_time_ms,
+        memory_bytes = plan.limits.memory_bytes,
+        max_processes = plan.limits.max_processes,
+        "sandbox audit"
+    );
 
     Ok(Some(CgroupBinding { manager, plan }))
 }
@@ -336,6 +411,17 @@ fn finalize_cgroup(
     let memory_limit_exceeded =
         stats.memory_events_oom.unwrap_or(0) > 0 || stats.memory_events_oom_kill.unwrap_or(0) > 0;
     let usage = stats.into_resource_usage(wall_time_ms);
+    info!(
+        target: "sandbox_audit",
+        audit_stage = "cgroup_finalized",
+        cgroup_path = %binding.plan.path_under(binding.manager.root()).display(),
+        cpu_time_ms = usage.cpu_time_ms,
+        wall_time_ms = usage.wall_time_ms,
+        memory_peak_bytes = usage.memory_peak_bytes,
+        cpu_limit_exceeded,
+        memory_limit_exceeded,
+        "sandbox audit"
+    );
     Ok(Some(FinalizedCgroup {
         usage,
         cpu_limit_exceeded,
@@ -903,6 +989,15 @@ fn wait_for_exit(
                 pid,
                 cpu_time_limit_ms, observed_cpu_time_usec, "cpu time limit exceeded"
             );
+            info!(
+                target: "sandbox_audit",
+                audit_stage = "termination_reason",
+                pid,
+                reason = "cpu_time_limit_exceeded",
+                observed_cpu_time_usec,
+                cpu_time_limit_ms,
+                "sandbox audit"
+            );
             terminate_process_group(pid);
             let status = child
                 .wait()
@@ -920,6 +1015,14 @@ fn wait_for_exit(
                 pid,
                 wall_limit_ms = wall_limit.as_millis(),
                 "wall clock limit exceeded"
+            );
+            info!(
+                target: "sandbox_audit",
+                audit_stage = "termination_reason",
+                pid,
+                reason = "wall_time_limit_exceeded",
+                wall_time_limit_ms = wall_limit.as_millis(),
+                "sandbox audit"
             );
             terminate_process_group(pid);
             let status = child
@@ -969,6 +1072,24 @@ fn send_signal_to_group(pid: i32, signal: i32) {
     }
 }
 
+fn cleanup_child_process_group(child: &mut Child) {
+    terminate_process_group(child.id() as i32);
+    let _ = child.wait();
+}
+
+fn cleanup_cgroup_after_error(binding: &CgroupBinding) {
+    if let Err(err) = binding.manager.cleanup(&binding.plan) {
+        warn!(
+            target: "sandbox_audit",
+            audit_stage = "cleanup_error",
+            cleanup_target = "cgroup",
+            cgroup_path = %binding.plan.path_under(binding.manager.root()).display(),
+            error = %err,
+            "failed to clean up cgroup after run error"
+        );
+    }
+}
+
 fn classify_status(
     timed_out: bool,
     cpu_timed_out: bool,
@@ -992,12 +1113,16 @@ fn classify_status(
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use sandbox_cgroup::{CgroupManager, CgroupPlan};
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{ExecutionStatus, SandboxError};
     use sandbox_testkit::{ResourceScenario, Scenario, SeccompScenario};
+    use tracing::dispatcher::Dispatch;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use crate::{RunOptions, cgroup_scope_name, probe_namespace_support, rootfs_cwd, run};
 
@@ -1055,6 +1180,80 @@ mod tests {
         .expect("command should run");
 
         assert_eq!(result.status, ExecutionStatus::WallTimeLimitExceeded);
+    }
+
+    #[test]
+    fn emits_structured_audit_events_for_run_lifecycle() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+            "#,
+        )
+        .expect("config should parse");
+        let artifact_dir = unique_artifact_dir("audit-lifecycle");
+        let logs = capture_logs(|| {
+            run(
+                &config,
+                &RunOptions {
+                    argv_override: None,
+                    artifact_dir: Some(artifact_dir),
+                    cgroup_root_override: None,
+                },
+            )
+            .expect("command should run")
+        });
+
+        assert!(logs.contains("audit_stage=\"run_start\""));
+        assert!(logs.contains("audit_stage=\"rootfs_prepared\""));
+        assert!(logs.contains("audit_stage=\"seccomp_configured\""));
+        assert!(logs.contains("audit_stage=\"payload_spawned\""));
+        assert!(logs.contains("audit_stage=\"run_finished\""));
+    }
+
+    #[test]
+    fn emits_structured_audit_events_for_cgroup_lifecycle() {
+        let artifact_dir = unique_artifact_dir("audit-cgroup");
+        let cgroup_root = unique_artifact_dir("audit-cgroup-root");
+        fs::create_dir_all(&cgroup_root).expect("cgroup root should exist");
+        fs::write(cgroup_root.join("cgroup.controllers"), "memory pids cpu\n")
+            .expect("controllers should exist");
+        let cgroup_dir = cgroup_root.join(cgroup_scope_name(&artifact_dir));
+
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "printf 'usage_usec 7000\n' > {cpu_stat}; printf '4096\n' > {memory_current}; printf '16384\n' > {memory_peak}; printf '2\n' > {pids_current}"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 16384
+                max_processes = 8
+            "#,
+            cpu_stat = shell_single_quote(&cgroup_dir.join("cpu.stat")),
+            memory_current = shell_single_quote(&cgroup_dir.join("memory.current")),
+            memory_peak = shell_single_quote(&cgroup_dir.join("memory.peak")),
+            pids_current = shell_single_quote(&cgroup_dir.join("pids.current")),
+        ))
+        .expect("config should parse");
+
+        let logs = capture_logs(|| {
+            run(
+                &config,
+                &RunOptions {
+                    argv_override: None,
+                    artifact_dir: Some(artifact_dir),
+                    cgroup_root_override: Some(cgroup_root),
+                },
+            )
+            .expect("command should run")
+        });
+
+        assert!(logs.contains("audit_stage=\"cgroup_prepared\""));
+        assert!(logs.contains("audit_stage=\"cgroup_finalized\""));
     }
 
     #[test]
@@ -1402,7 +1601,6 @@ mod tests {
         fs::create_dir_all(&input_dir).expect("input dir should exist");
         let input_file = input_dir.join("input.txt");
         fs::write(&input_file, "seed").expect("input file should exist");
-
         let config = ExecutionConfig::from_toml_str(&format!(
             r#"
                 [process]
@@ -1420,13 +1618,13 @@ mod tests {
                 chroot_to_rootfs = true
                 work_dir = "/work"
                 tmp_dir = "/tmp"
-                readonly_bind_paths = ["{input_file}"]
+                readonly_bind_paths = ["{host_input_file}"]
                 output_dir = "/output"
                 executable_bind_paths = ["/bin", "/usr/bin"]
             "#,
             readonly_probe = Scenario::ReadonlyInputProbe.shell_snippet(),
             output_probe = Scenario::WritableOutputProbe.shell_snippet(),
-            input_file = input_file.display(),
+            host_input_file = input_file.display(),
         ))
         .expect("config should parse");
 
@@ -2020,6 +2218,149 @@ mod tests {
     }
 
     #[test]
+    fn cleans_up_cgroup_when_setup_fails_after_creation() {
+        let artifact_dir = unique_artifact_dir("cgroup-setup-cleanup");
+        let cgroup_root = unique_artifact_dir("cgroup-setup-cleanup-root");
+        fs::create_dir_all(&cgroup_root).expect("cgroup root should exist");
+        fs::write(cgroup_root.join("cgroup.controllers"), "memory pids cpu\n")
+            .expect("controllers should exist");
+        let cgroup_dir = cgroup_root.join(cgroup_scope_name(&artifact_dir));
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 4096
+
+                [io]
+                stdout_path = "/tmp/escaped-stdout.log"
+            "#,
+        )
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+                cgroup_root_override: Some(cgroup_root),
+            },
+        )
+        .expect_err("run should fail");
+
+        assert!(
+            err.to_string()
+                .contains("configured path must stay within artifact directory")
+        );
+        assert!(
+            !cgroup_dir.exists(),
+            "cgroup directory should be cleaned up after setup failure"
+        );
+    }
+
+    #[test]
+    fn cleans_up_cgroup_when_spawn_fails_after_creation() {
+        let artifact_dir = unique_artifact_dir("cgroup-spawn-cleanup");
+        let cgroup_root = unique_artifact_dir("cgroup-spawn-cleanup-root");
+        fs::create_dir_all(&cgroup_root).expect("cgroup root should exist");
+        fs::write(cgroup_root.join("cgroup.controllers"), "memory pids cpu\n")
+            .expect("controllers should exist");
+        let cgroup_dir = cgroup_root.join(cgroup_scope_name(&artifact_dir));
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/definitely-missing-sandbox-command"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 4096
+            "#,
+        )
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+                cgroup_root_override: Some(cgroup_root),
+            },
+        )
+        .expect_err("run should fail");
+
+        match err {
+            SandboxError::Spawn(_) => {}
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(
+            !cgroup_dir.exists(),
+            "cgroup directory should be cleaned up after spawn failure"
+        );
+    }
+
+    #[test]
+    fn kills_spawned_process_group_and_cleans_up_cgroup_when_waiting_fails() {
+        let artifact_dir = unique_artifact_dir("wait-error-cleanup");
+        let cgroup_root = unique_artifact_dir("wait-error-cleanup-root");
+        fs::create_dir_all(&cgroup_root).expect("cgroup root should exist");
+        fs::write(cgroup_root.join("cgroup.controllers"), "memory pids cpu\n")
+            .expect("controllers should exist");
+        let cgroup_dir = cgroup_root.join(cgroup_scope_name(&artifact_dir));
+        let shell_pid_path = artifact_dir.join("shell.pid");
+        let worker_pid_path = artifact_dir.join("worker.pid");
+
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "printf '%s\n' $$ > {shell_pid}; /bin/sleep 5 & child=$!; printf '%s\n' \"$child\" > {worker_pid}; printf 'usage_usec nope\n' > {cpu_stat}; wait \"$child\""]
+
+                [limits]
+                wall_time_ms = 5000
+                cpu_time_ms = 100
+            "#,
+            shell_pid = shell_single_quote(&shell_pid_path),
+            worker_pid = shell_single_quote(&worker_pid_path),
+            cpu_stat = shell_single_quote(&cgroup_dir.join("cpu.stat")),
+        ))
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+                cgroup_root_override: Some(cgroup_root),
+            },
+        )
+        .expect_err("run should fail");
+
+        assert!(
+            err.to_string().contains("invalid cgroup key/value entry"),
+            "unexpected error: {err}"
+        );
+        let shell_pid =
+            read_pid_with_retry(&shell_pid_path).expect("shell pid should be recorded before exit");
+        let worker_pid = read_pid_with_retry(&worker_pid_path)
+            .expect("worker pid should be recorded before cleanup");
+        assert!(
+            wait_for_process_exit(shell_pid, Duration::from_secs(1)),
+            "shell process should be terminated on wait error"
+        );
+        assert!(
+            wait_for_process_exit(worker_pid, Duration::from_secs(1)),
+            "child process should be terminated on wait error"
+        );
+        assert!(
+            !cgroup_dir.exists(),
+            "cgroup directory should be cleaned up after wait failure"
+        );
+    }
+
+    #[test]
     fn reports_capability_error_when_cgroup_v2_root_is_unavailable() {
         let config = ExecutionConfig::from_toml_str(
             r#"
@@ -2426,5 +2767,92 @@ mod tests {
         }
         let _ = manager.cleanup(&plan);
         true
+    }
+
+    fn read_pid_with_retry(path: &Path) -> Option<i32> {
+        for _ in 0..100 {
+            if let Ok(raw) = fs::read_to_string(path) {
+                if let Ok(pid) = raw.trim().parse::<i32>() {
+                    return Some(pid);
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        None
+    }
+
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if !process_exists(pid) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        !process_exists(pid)
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        let result = unsafe { libc::kill(pid, 0) };
+        if result == 0 {
+            return true;
+        }
+
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> String {
+        let writer = SharedWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .finish();
+        let dispatch = Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, f);
+        writer.contents()
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn contents(&self) -> String {
+            String::from_utf8(self.buffer.lock().expect("buffer should lock").clone())
+                .expect("logs should be utf8")
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriterGuard {
+                buffer: self.buffer.clone(),
+            }
+        }
+    }
+
+    struct SharedWriterGuard {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("buffer should lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

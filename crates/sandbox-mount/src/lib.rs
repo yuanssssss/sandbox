@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::os::unix::ffi::OsStrExt;
@@ -128,15 +129,23 @@ pub fn prepare_rootfs(config: &FilesystemConfig, artifact_dir: &Path) -> Result<
         }
     }
 
+    let mut readonly_targets = HashSet::new();
     for source in &config.readonly_bind_paths {
         if source.exists() {
+            let target = readonly_mount_target(source)?;
+            if !readonly_targets.insert(target.clone()) {
+                return Err(SandboxError::config(format!(
+                    "filesystem.readonly_bind_paths resolve to duplicate sandbox path: {}",
+                    target.display()
+                )));
+            }
             mounts.push(MountPlanEntry {
                 kind: MountKind::BindReadOnly,
                 source: Some(source.clone()),
-                target: source.clone(),
+                target: target.clone(),
                 flags: vec!["ro".into(), "rbind".into()],
             });
-            materialize_bind_mount_target(&layout.root, source, source)?;
+            materialize_bind_mount_target(&layout.root, &target, source)?;
         }
     }
 
@@ -351,6 +360,18 @@ fn materialize_bind_mount_target(root: &Path, sandbox_path: &Path, source: &Path
             .map_err(|err| SandboxError::io("creating rootfs bind mount file target", err))?;
     }
     Ok(())
+}
+
+fn readonly_mount_target(source: &Path) -> Result<PathBuf> {
+    let name = source.file_name().ok_or_else(|| {
+        SandboxError::config(format!(
+            "filesystem.readonly_bind_paths must not point to a root path: {}",
+            source.display()
+        ))
+    })?;
+
+    // Keep readonly inputs under a dedicated prefix so /tmp and /work mounts do not hide them.
+    Ok(Path::new("/inputs").join(name))
 }
 
 fn host_mount_target(root: &Path, sandbox_path: &Path) -> Result<PathBuf> {
@@ -585,12 +606,40 @@ mod tests {
         assert!(plan.mounts.iter().any(|mount| mount.source.as_deref()
             == Some(input_path.as_path())
             && mount.kind == MountKind::BindReadOnly));
+        assert!(plan.mounts.iter().any(|mount| {
+            mount.source.as_deref() == Some(input_path.as_path())
+                && mount.target == PathBuf::from("/inputs/input.txt")
+                && mount.kind == MountKind::BindReadOnly
+        }));
         assert!(
             plan.mounts
                 .iter()
                 .any(|mount| mount.target == PathBuf::from("/output")
                     && mount.kind == MountKind::BindReadWrite)
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_readonly_input_target_names() {
+        let artifact_dir = unique_dir("readonly-duplicates");
+        let first_root = unique_dir("readonly-first");
+        let second_root = unique_dir("readonly-second");
+        let first = first_root.join("input.txt");
+        let second = second_root.join("input.txt");
+        fs::create_dir_all(first.parent().expect("parent should exist"))
+            .expect("first parent should exist");
+        fs::create_dir_all(second.parent().expect("parent should exist"))
+            .expect("second parent should exist");
+        fs::write(&first, "first").expect("first file should exist");
+        fs::write(&second, "second").expect("second file should exist");
+        let config = FilesystemConfig {
+            readonly_bind_paths: vec![first, second],
+            ..FilesystemConfig::default()
+        };
+
+        let err = prepare_rootfs(&config, &artifact_dir).expect_err("duplicate inputs should fail");
+
+        assert!(err.to_string().contains("duplicate sandbox path"));
     }
 
     #[test]

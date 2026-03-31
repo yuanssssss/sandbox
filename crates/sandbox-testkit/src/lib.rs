@@ -53,7 +53,7 @@ impl ResourceScenario {
     pub fn python_snippet(self) -> &'static str {
         match self {
             Self::ForkBombProbe => {
-                "import os; import sys; exec(\"try:\\n os.fork()\\n raise SystemExit(1)\\nexcept OSError as err:\\n print(err.errno)\\n raise SystemExit(0 if err.errno == 11 else 2)\")"
+                "import errno, os; exec(\"try:\\n os.fork()\\n raise SystemExit(1)\\nexcept OSError as err:\\n print(err.errno)\\n raise SystemExit(0 if err.errno in (errno.EAGAIN, errno.ENOMEM) else 2)\")"
             }
             Self::SmallProcessTree => {
                 "import os; exec(\"pid = os.fork()\\nif pid == 0:\\n raise SystemExit(0)\\nended_pid, status = os.waitpid(pid, 0)\\nprint(ended_pid > 0)\\nraise SystemExit(0 if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else 1)\")"
