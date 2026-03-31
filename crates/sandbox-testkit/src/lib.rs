@@ -40,6 +40,126 @@ impl Scenario {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaliciousScenario {
+    HostFilesystemEscape,
+    ProcInfoLeakProbe,
+    ReadonlyInputTamper,
+    StrictSocketCreation,
+    DefaultPtraceProbe,
+}
+
+impl MaliciousScenario {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::HostFilesystemEscape => "host_filesystem_escape",
+            Self::ProcInfoLeakProbe => "proc_info_leak_probe",
+            Self::ReadonlyInputTamper => "readonly_input_tamper",
+            Self::StrictSocketCreation => "strict_socket_creation",
+            Self::DefaultPtraceProbe => "default_ptrace_probe",
+        }
+    }
+
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::HostFilesystemEscape => "attempt to read a host-only file after rootfs isolation",
+            Self::ProcInfoLeakProbe => "attempt to inspect process information through /proc",
+            Self::ReadonlyInputTamper => "attempt to overwrite a readonly input file",
+            Self::StrictSocketCreation => "attempt to create a network socket under strict seccomp",
+            Self::DefaultPtraceProbe => "attempt to call ptrace under the default seccomp profile",
+        }
+    }
+
+    pub fn expected_guardrail(self) -> &'static str {
+        match self {
+            Self::HostFilesystemEscape => "chroot/rootfs visibility isolation",
+            Self::ProcInfoLeakProbe => "minimal /proc mount inside pid namespace",
+            Self::ReadonlyInputTamper => "readonly bind mount policy",
+            Self::StrictSocketCreation => "strict seccomp socket deny rule",
+            Self::DefaultPtraceProbe => "default seccomp ptrace deny rule",
+        }
+    }
+
+    pub fn argv(self) -> Vec<String> {
+        match self {
+            Self::HostFilesystemEscape => vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                Scenario::HostVisibilityProbe.shell_snippet().to_string(),
+            ],
+            Self::ProcInfoLeakProbe => vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                Scenario::ProcVisibilityProbe.shell_snippet().to_string(),
+            ],
+            Self::ReadonlyInputTamper => vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                Scenario::ReadonlyInputProbe.shell_snippet().to_string(),
+            ],
+            Self::StrictSocketCreation => vec![
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                "import socket; exec(\"try:\\n socket.socket(socket.AF_INET, socket.SOCK_STREAM)\\n raise SystemExit(1)\\nexcept OSError as err:\\n print(err.errno)\\n raise SystemExit(0 if err.errno == 1 else 2)\")"
+                    .to_string(),
+            ],
+            Self::DefaultPtraceProbe => vec![
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                "import ctypes; libc = ctypes.CDLL(None, use_errno=True); result = libc.ptrace(0, 0, None, 0); err = ctypes.get_errno(); print(result); print(err); raise SystemExit(0 if result == -1 and err == 1 else 1)"
+                    .to_string(),
+            ],
+        }
+    }
+}
+
+pub fn malicious_scenarios() -> &'static [MaliciousScenario] {
+    &[
+        MaliciousScenario::HostFilesystemEscape,
+        MaliciousScenario::ProcInfoLeakProbe,
+        MaliciousScenario::ReadonlyInputTamper,
+        MaliciousScenario::StrictSocketCreation,
+        MaliciousScenario::DefaultPtraceProbe,
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StressScenario {
+    EchoBurst,
+    WorkDirRoundTrip,
+    CpuBoundSuccess,
+}
+
+impl StressScenario {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::EchoBurst => "echo_burst",
+            Self::WorkDirRoundTrip => "workdir_round_trip",
+            Self::CpuBoundSuccess => "cpu_bound_success",
+        }
+    }
+
+    pub fn argv(self) -> Vec<String> {
+        match self {
+            Self::EchoBurst => vec!["/bin/echo".to_string(), "stress-ok".to_string()],
+            Self::WorkDirRoundTrip => vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf 'stress' > /work/stress.txt && cat /work/stress.txt".to_string(),
+            ],
+            Self::CpuBoundSuccess => ResourceScenario::CpuBoundSuccess.argv(),
+        }
+    }
+}
+
+pub fn stress_scenarios() -> &'static [StressScenario] {
+    &[
+        StressScenario::EchoBurst,
+        StressScenario::WorkDirRoundTrip,
+        StressScenario::CpuBoundSuccess,
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceScenario {
     ForkBombProbe,
     SmallProcessTree,
@@ -109,7 +229,7 @@ pub fn roadmap() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResourceScenario, SeccompScenario};
+    use super::{ResourceScenario, SeccompScenario, malicious_scenarios, stress_scenarios};
 
     #[test]
     fn resource_scenarios_emit_python_commands() {
@@ -135,6 +255,30 @@ mod tests {
             SeccompScenario::PythonRuntime,
         ] {
             let argv = scenario.argv();
+            assert!(!argv.is_empty());
+            assert!(!argv[0].trim().is_empty());
+            assert!(!argv[argv.len() - 1].trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn malicious_scenarios_have_metadata_and_commands() {
+        for scenario in malicious_scenarios() {
+            let argv = scenario.argv();
+            assert!(!scenario.id().trim().is_empty());
+            assert!(!scenario.summary().trim().is_empty());
+            assert!(!scenario.expected_guardrail().trim().is_empty());
+            assert!(!argv.is_empty());
+            assert!(!argv[0].trim().is_empty());
+            assert!(!argv[argv.len() - 1].trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn stress_scenarios_emit_commands() {
+        for scenario in stress_scenarios() {
+            let argv = scenario.argv();
+            assert!(!scenario.id().trim().is_empty());
             assert!(!argv.is_empty());
             assert!(!argv[0].trim().is_empty());
             assert!(!argv[argv.len() - 1].trim().is_empty());

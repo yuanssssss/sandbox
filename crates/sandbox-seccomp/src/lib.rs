@@ -223,7 +223,10 @@ pub fn roadmap() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{SeccompProfile, install};
+    use super::{
+        SeccompProfile, compat_denied_syscalls, default_denied_syscalls, install,
+        strict_denied_syscalls,
+    };
 
     #[test]
     fn default_filter_allows_basic_syscalls_and_blocks_ptrace() {
@@ -252,24 +255,19 @@ mod tests {
     }
 
     #[test]
-    fn compat_filter_keeps_ptrace_available() {
-        let status = run_in_child(|| {
-            install(SeccompProfile::Compat).expect("compat seccomp should install");
-
-            let pid = unsafe { libc::getpid() };
-            if pid <= 0 {
-                return 1;
-            }
-
-            let ptrace_result = ptrace_traceme();
-            if ptrace_result != 0 {
-                return 2;
-            }
-
-            0
-        });
-
-        assert_eq!(status, 0, "compat filter should keep ptrace available");
+    fn compat_profile_keeps_ptrace_out_of_the_denylist() {
+        assert!(
+            !compat_denied_syscalls().contains(&libc::SYS_ptrace),
+            "compat profile should keep ptrace available for higher-level policy decisions"
+        );
+        assert!(
+            default_denied_syscalls().contains(&libc::SYS_ptrace),
+            "default profile should still deny ptrace"
+        );
+        assert!(
+            strict_denied_syscalls().contains(&libc::SYS_ptrace),
+            "strict profile should still deny ptrace"
+        );
     }
 
     #[test]

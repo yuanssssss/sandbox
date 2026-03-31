@@ -51,6 +51,10 @@
   - CLI 已补用户可见错误报告：可区分配置问题、能力缺失、I/O/setup 失败与 payload 运行失败，并给出建议排查方向
   - 已补 `configs/minimal.toml` 与 `configs/strict.toml` 两套模板，分别覆盖“尽量易跑通”和“尽量强隔离”两类本地调试场景
   - 已补 `inspect` / `debug` 调试命令，可直接查看派生的 artifact/rootfs/cgroup 路径、namespace 可用性与执行结果
+- `M6` 安全验证：
+  - 已在 `sandbox-testkit` 中补恶意样例与压力场景 catalog，见 `docs/malicious_sample_catalog.md`
+  - 已补本地回归脚本 `scripts/run_regression_suite.sh` 与 GitHub Actions `regression.yml`
+  - 已补压力脚本 `scripts/run_stress_suite.sh`、工作流 `stress.yml`，并生成基线报告 `docs/stress_test_report.md`
 
 ## Workspace 结构
 
@@ -98,6 +102,18 @@ cargo run -p sandbox-cli -- inspect --config configs/strict.toml
 cargo run -p sandbox-cli -- debug --config configs/minimal.toml
 ```
 
+运行本地回归：
+
+```bash
+./scripts/run_regression_suite.sh
+```
+
+生成压力报告：
+
+```bash
+./scripts/run_stress_suite.sh --iterations 12 --concurrency 4 --report docs/stress_test_report.md
+```
+
 其中：
 
 - `validate` 只检查配置并打印摘要
@@ -131,10 +147,10 @@ cargo run -p sandbox-cli -- run --config configs/minimal.toml --command /bin/ech
 
 优先继续做这些任务：
 
-1. 把 cgroup v2 的 CPU 控制与更完整统计接上
-2. 继续扩 seccomp profile 与 deny-list 覆盖
-3. 继续做 mount / cgroup / 子进程失败路径的清理加固
-4. 补审计日志和更细的用户可见错误报告
+1. 完成 `T047` 的上线前安全评审清单
+2. 继续补编译阶段、checker 分层和 Unix domain socket 相关攻击样例
+3. 继续扩真实 cgroup v2 / namespace 特权环境下的压力基线
+4. 视威胁模型再补更细的 seccomp 与 LSM/微虚拟机路线
 
 ## 验证
 

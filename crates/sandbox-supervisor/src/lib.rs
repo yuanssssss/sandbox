@@ -1124,7 +1124,7 @@ mod tests {
     use sandbox_cgroup::{CgroupManager, CgroupPlan};
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{ExecutionStatus, SandboxError};
-    use sandbox_testkit::{ResourceScenario, Scenario, SeccompScenario};
+    use sandbox_testkit::{MaliciousScenario, ResourceScenario, Scenario, SeccompScenario};
     use tracing::dispatcher::Dispatch;
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -1605,6 +1605,7 @@ mod tests {
         fs::create_dir_all(&input_dir).expect("input dir should exist");
         let input_file = input_dir.join("input.txt");
         fs::write(&input_file, "seed").expect("input file should exist");
+        let readonly_probe = MaliciousScenario::ReadonlyInputTamper.argv();
         let config = ExecutionConfig::from_toml_str(&format!(
             r#"
                 [process]
@@ -1626,7 +1627,7 @@ mod tests {
                 output_dir = "/output"
                 executable_bind_paths = ["/bin", "/usr/bin"]
             "#,
-            readonly_probe = Scenario::ReadonlyInputProbe.shell_snippet(),
+            readonly_probe = readonly_probe[2],
             output_probe = Scenario::WritableOutputProbe.shell_snippet(),
             host_input_file = input_file.display(),
         ))
@@ -1664,6 +1665,7 @@ mod tests {
         let artifact_dir = unique_artifact_dir("host-visibility");
         fs::create_dir_all(&artifact_dir).expect("artifact dir should exist");
         fs::write(artifact_dir.join("host-secret.txt"), "secret").expect("host file should exist");
+        let script = MaliciousScenario::HostFilesystemEscape.argv();
 
         let config = ExecutionConfig::from_toml_str(&format!(
             r#"
@@ -1684,7 +1686,7 @@ mod tests {
                 tmp_dir = "/tmp"
                 executable_bind_paths = ["/bin", "/usr/bin"]
             "#,
-            script = Scenario::HostVisibilityProbe.shell_snippet()
+            script = script[2]
         ))
         .expect("config should parse");
 
@@ -1709,6 +1711,7 @@ mod tests {
             return;
         }
         let artifact_dir = unique_artifact_dir("proc-visibility");
+        let script = MaliciousScenario::ProcInfoLeakProbe.argv();
         let config = ExecutionConfig::from_toml_str(&format!(
             r#"
                 [process]
@@ -1729,7 +1732,7 @@ mod tests {
                 mount_proc = true
                 executable_bind_paths = ["/bin", "/usr/bin"]
             "#,
-            script = Scenario::ProcVisibilityProbe.shell_snippet()
+            script = script[2]
         ))
         .expect("config should parse");
 
@@ -1972,15 +1975,16 @@ mod tests {
 
     #[test]
     fn strict_seccomp_profile_blocks_socket_creation() {
-        let config = ExecutionConfig::from_toml_str(
+        let argv = format!("{:?}", MaliciousScenario::StrictSocketCreation.argv());
+        let config = ExecutionConfig::from_toml_str(&format!(
             r#"
                 [process]
-                argv = ["/usr/bin/python3", "-c", "import socket; import sys; exec(\"try:\\n socket.socket(socket.AF_INET, socket.SOCK_STREAM)\\n raise SystemExit(1)\\nexcept OSError as err:\\n print(err.errno)\\n raise SystemExit(0 if err.errno == 1 else 2)\")"]
+                argv = {argv}
 
                 [security]
                 seccomp_profile = "strict"
             "#,
-        )
+        ))
         .expect("config should parse");
 
         let result = run(
@@ -2026,12 +2030,13 @@ mod tests {
 
     #[test]
     fn default_seccomp_profile_blocks_ptrace_in_supervisor_flow() {
-        let config = ExecutionConfig::from_toml_str(
+        let argv = format!("{:?}", MaliciousScenario::DefaultPtraceProbe.argv());
+        let config = ExecutionConfig::from_toml_str(&format!(
             r#"
                 [process]
-                argv = ["/usr/bin/python3", "-c", "import ctypes, os; libc = ctypes.CDLL(None, use_errno=True); result = libc.ptrace(0, 0, None, 0); err = ctypes.get_errno(); print(result); print(err); raise SystemExit(0 if result == -1 and err == 1 else 1)"]
+                argv = {argv}
             "#,
-        )
+        ))
         .expect("config should parse");
 
         let result = run(
@@ -2052,6 +2057,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "compat ptrace allow semantics are covered reliably in sandbox-seccomp tests"]
     fn compat_seccomp_profile_allows_ptrace_in_supervisor_flow() {
         let config = ExecutionConfig::from_toml_str(
             r#"

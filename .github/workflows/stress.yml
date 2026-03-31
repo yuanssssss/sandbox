@@ -1,0 +1,50 @@
+name: stress
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: Config file to use for the stress run
+        required: false
+        default: configs/minimal.toml
+      scenario:
+        description: Stress scenario id
+        required: false
+        default: echo_burst
+      iterations:
+        description: Total run count
+        required: false
+        default: "12"
+      concurrency:
+        description: Parallel run count
+        required: false
+        default: "4"
+
+jobs:
+  stress:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run stress harness
+        run: |
+          ./scripts/run_stress_suite.sh \
+            --config "${{ github.event.inputs.config }}" \
+            --scenario "${{ github.event.inputs.scenario }}" \
+            --iterations "${{ github.event.inputs.iterations }}" \
+            --concurrency "${{ github.event.inputs.concurrency }}" \
+            --report .sandbox-runs/stress/latest-report.md
+
+      - name: Upload stress artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-report
+          path: .sandbox-runs/stress
