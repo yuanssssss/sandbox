@@ -1,0 +1,40 @@
+[process]
+argv = ["/bin/echo", "hello from strict sandbox"]
+cwd = "/work"
+env = ["LANG=C", "PATH=/usr/bin:/bin"]
+clear_env = true
+
+[limits]
+wall_time_ms = 3000
+cpu_time_ms = 1000
+memory_bytes = 134217728
+max_processes = 32
+
+[io]
+artifact_dir = ".sandbox-runs/strict"
+
+[security]
+seccomp_profile = "strict"
+
+[filesystem]
+enable_rootfs = true
+enter_user_namespace = true
+enter_mount_namespace = true
+enter_pid_namespace = true
+enter_network_namespace = true
+enter_ipc_namespace = true
+apply_mounts = true
+chroot_to_rootfs = true
+mount_proc = true
+drop_capabilities = true
+work_dir = "/work"
+tmp_dir = "/tmp"
+executable_bind_paths = ["/bin", "/usr/bin"]
+# 把宿主机只读输入挂到沙箱内的 `/inputs/<basename>`。
+# readonly_bind_paths = ["/abs/path/to/input.txt"]
+# 把沙箱输出目录映射到 artifact 下的受控可写目录。
+# output_dir = "/output"
+
+# 这个模板适合需要“尽量强隔离”的本地调试：
+# - 要求 Linux 宿主机支持 user/mount/pid/network/ipc namespace
+# - 要求可写 cgroup v2 以启用 CPU / memory / pids 限制

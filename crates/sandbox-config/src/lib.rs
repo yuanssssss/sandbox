@@ -388,6 +388,7 @@ const fn default_mount_proc() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::path::PathBuf;
 
     use super::ExecutionConfig;
@@ -449,6 +450,34 @@ mod tests {
         assert!(config.filesystem.executable_bind_paths.is_empty());
         assert!(config.filesystem.readonly_bind_paths.is_empty());
         assert_eq!(config.filesystem.output_dir, None);
+    }
+
+    #[test]
+    fn example_configs_parse_successfully() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir should have parent")
+            .parent()
+            .expect("workspace root should exist");
+
+        let minimal = ExecutionConfig::load(workspace_root.join("configs/minimal.toml"))
+            .expect("minimal config should parse");
+        let strict = ExecutionConfig::load(workspace_root.join("configs/strict.toml"))
+            .expect("strict config should parse");
+
+        assert_eq!(minimal.security.seccomp_profile, SeccompProfile::Default);
+        assert!(!minimal.filesystem.enter_user_namespace);
+        assert_eq!(strict.security.seccomp_profile, SeccompProfile::Strict);
+        assert!(strict.filesystem.enter_user_namespace);
+        assert!(strict.filesystem.enter_mount_namespace);
+        assert!(strict.filesystem.enter_pid_namespace);
+        assert!(strict.filesystem.enter_network_namespace);
+        assert!(strict.filesystem.enter_ipc_namespace);
+        assert!(strict.filesystem.apply_mounts);
+        assert!(strict.filesystem.chroot_to_rootfs);
+        assert_eq!(strict.limits.cpu_time_ms, Some(1000));
+        assert_eq!(strict.limits.memory_bytes, Some(134_217_728));
+        assert_eq!(strict.limits.max_processes, Some(32));
     }
 
     #[test]

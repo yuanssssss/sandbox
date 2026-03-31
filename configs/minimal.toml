@@ -14,13 +14,15 @@ wall_time_ms = 1000
 # max_processes = 32
 
 [io]
-artifact_dir = ".sandbox-runs/example"
+artifact_dir = ".sandbox-runs/minimal"
 
 [security]
 seccomp_profile = "default"
 
 [filesystem]
 enable_rootfs = true
+# 这个模板优先保证“普通开发环境先跑通”。
+# 如果你需要更强隔离，请直接参考同目录下的 `strict.toml`。
 enter_user_namespace = false
 enter_mount_namespace = false
 enter_pid_namespace = false
@@ -34,11 +36,3 @@ tmp_dir = "/tmp"
 executable_bind_paths = ["/bin", "/usr/bin"]
 # readonly_bind_paths = ["/abs/path/to/input.txt"]
 # output_dir = "/output"
-
-# 更强隔离示例：
-# enter_user_namespace = true
-# enter_mount_namespace = true
-# enter_pid_namespace = true
-# apply_mounts = true
-# chroot_to_rootfs = true
-# mount_proc = true

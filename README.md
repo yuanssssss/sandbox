@@ -49,6 +49,7 @@
   - 已通过 `tracing` 输出 `sandbox_audit` 结构化事件，覆盖 `run_start`、`rootfs_prepared`、`cgroup_prepared`、`payload_spawned`、`termination_reason`、`cgroup_finalized`、`run_finished`
   - 已加固异常清理路径：setup/spawn/wait 异常后会清理 cgroup，并终止已启动的 payload 进程组
   - CLI 已补用户可见错误报告：可区分配置问题、能力缺失、I/O/setup 失败与 payload 运行失败，并给出建议排查方向
+  - 已补 `configs/minimal.toml` 与 `configs/strict.toml` 两套模板，分别覆盖“尽量易跑通”和“尽量强隔离”两类本地调试场景
 
 ## Workspace 结构
 
@@ -73,43 +74,32 @@ crates/
 
 ```bash
 cargo run -p sandbox-cli -- validate --config configs/minimal.toml
+cargo run -p sandbox-cli -- validate --config configs/strict.toml
 ```
 
 执行示例配置：
 
 ```bash
 cargo run -p sandbox-cli -- run --config configs/minimal.toml
+cargo run -p sandbox-cli -- run --config configs/strict.toml
 ```
 
-当前 `configs/minimal.toml` 默认保持“尽量容易在普通开发环境跑通”的配置：
+当前仓库提供两套模板：
 
-- 默认启用 `security.seccomp_profile = "default"`
-- 默认不启用 mount / pid / network / ipc / user namespace
-- 默认不启用 cgroup 限额写入，`cpu_time_ms` / `memory_bytes` / `max_processes` 需要按需打开
+- `configs/minimal.toml`
+  - 默认启用 `security.seccomp_profile = "default"`
+  - 默认不启用 mount / pid / network / ipc / user namespace
+  - 默认不启用 cgroup 限额写入，适合先验证最小执行链路
+- `configs/strict.toml`
+  - 默认启用 `security.seccomp_profile = "strict"`
+  - 默认启用 user / mount / pid / network / ipc namespace、`chroot`、`mount_proc`
+  - 默认启用 `cpu_time_ms`、`memory_bytes`、`max_processes`
+  - 适合在支持 namespace 和可写 cgroup v2 的 Linux 环境里验证更强隔离
 
-如果你要开启更强隔离：
+使用 `strict.toml` 前需要确认：
 
 - 设置 `limits.cpu_time_ms`、`limits.memory_bytes` 或 `limits.max_processes` 会启用 cgroup v2，要求宿主机提供可写 cgroup v2
 - 设置 `filesystem.enter_user_namespace` / `enter_mount_namespace` / `enter_pid_namespace` 等开关时，要求宿主机支持对应 namespace
-
-一个更强的配置通常至少会包含：
-
-```toml
-[limits]
-memory_bytes = 134217728
-max_processes = 32
-
-[security]
-seccomp_profile = "default"
-
-[filesystem]
-enter_user_namespace = true
-enter_mount_namespace = true
-enter_pid_namespace = true
-apply_mounts = true
-chroot_to_rootfs = true
-mount_proc = true
-```
 
 覆盖命令：
 
