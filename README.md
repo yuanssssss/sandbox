@@ -164,6 +164,14 @@ cargo run -p sandbox-cli -- serve \
 - 环境变量 `SANDBOX_PROTOCOL_AUTH_TOKEN` 或配置文件中声明的 `auth_token_env`
 - 内置默认值
 
+细粒度权限：
+
+- `auth_token` 仍可作为兼容入口，统一保护所有 `/api/v1/...` 路由
+- 如果配置了 `read_auth_token` / `write_auth_token`：
+  - `GET` / `HEAD` API 路由接受 read 或 write token
+  - `POST` API 路由只接受 write token
+  - `GET /healthz` 始终免鉴权
+
 ## Docker 环境
 
 仓库根目录现在提供了两套容器环境：

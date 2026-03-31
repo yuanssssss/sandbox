@@ -38,6 +38,8 @@ pub type BackendFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 #[derive(Debug, Clone)]
 pub struct ProtocolServerOptions {
     pub auth_token: Option<String>,
+    pub read_auth_token: Option<String>,
+    pub write_auth_token: Option<String>,
     pub max_request_body_bytes: usize,
     pub max_concurrent_requests: usize,
 }
@@ -46,6 +48,8 @@ impl Default for ProtocolServerOptions {
     fn default() -> Self {
         Self {
             auth_token: None,
+            read_auth_token: None,
+            write_auth_token: None,
             max_request_body_bytes: 1024 * 1024,
             max_concurrent_requests: 32,
         }
@@ -54,7 +58,8 @@ impl Default for ProtocolServerOptions {
 
 #[derive(Debug, Clone)]
 struct ApiMiddlewareState {
-    auth_token: Option<Arc<str>>,
+    read_auth_token: Option<Arc<str>>,
+    write_auth_token: Option<Arc<str>>,
     max_request_body_bytes: usize,
     max_concurrent_requests: usize,
     semaphore: Arc<Semaphore>,
@@ -62,8 +67,20 @@ struct ApiMiddlewareState {
 
 impl ApiMiddlewareState {
     fn from_options(options: &ProtocolServerOptions) -> Self {
+        let legacy = options.auth_token.clone().map(Arc::<str>::from);
+        let read_auth_token = options
+            .read_auth_token
+            .clone()
+            .map(Arc::<str>::from)
+            .or_else(|| legacy.clone());
+        let write_auth_token = options
+            .write_auth_token
+            .clone()
+            .map(Arc::<str>::from)
+            .or_else(|| legacy.clone());
         Self {
-            auth_token: options.auth_token.clone().map(Arc::<str>::from),
+            read_auth_token,
+            write_auth_token,
             max_request_body_bytes: options.max_request_body_bytes,
             max_concurrent_requests: options.max_concurrent_requests,
             semaphore: Arc::new(Semaphore::new(options.max_concurrent_requests.max(1))),
@@ -1366,13 +1383,46 @@ fn authorization_matches_expected(header: Option<&HeaderValue>, expected_token: 
     token == expected_token
 }
 
+fn authorization_matches_any(
+    header: Option<&HeaderValue>,
+    expected_tokens: &[Option<Arc<str>>],
+) -> bool {
+    expected_tokens
+        .iter()
+        .flatten()
+        .any(|token| authorization_matches_expected(header, token))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ApiAccessLevel {
+    Read,
+    Write,
+}
+
+impl ApiAccessLevel {
+    fn from_request(request: &Request<AxumBody>) -> Self {
+        match *request.method() {
+            axum::http::Method::GET | axum::http::Method::HEAD => Self::Read,
+            _ => Self::Write,
+        }
+    }
+}
+
 async fn api_guard_middleware(
     State(state): State<ApiMiddlewareState>,
     request: Request<AxumBody>,
     next: Next,
 ) -> Result<Response, ProtocolError> {
-    if let Some(expected_token) = state.auth_token.as_deref() {
-        if !authorization_matches_expected(request.headers().get(AUTHORIZATION), expected_token) {
+    let access_level = ApiAccessLevel::from_request(&request);
+    let expected_tokens = match access_level {
+        ApiAccessLevel::Read => vec![
+            state.read_auth_token.clone(),
+            state.write_auth_token.clone(),
+        ],
+        ApiAccessLevel::Write => vec![state.write_auth_token.clone()],
+    };
+    if expected_tokens.iter().flatten().next().is_some() {
+        if !authorization_matches_any(request.headers().get(AUTHORIZATION), &expected_tokens) {
             return Err(unauthorized_error());
         }
     }
@@ -3773,6 +3823,75 @@ enable_rootfs = false
         )
         .await;
         assert_eq!(authorized_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn read_and_write_tokens_enforce_route_permissions() {
+        let app = build_router_with_options(
+            TestBackend,
+            ProtocolServerOptions {
+                read_auth_token: Some("read-token".to_string()),
+                write_auth_token: Some("write-token".to_string()),
+                ..ProtocolServerOptions::default()
+            },
+        );
+        let payload = serde_json::to_vec(&ExecutionRequest {
+            request_id: "scoped-run-001".to_string(),
+            config: sample_config(),
+            command_override: None,
+            artifact_dir: None,
+        })
+        .unwrap();
+
+        let read_response = send(
+            &app,
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/capabilities")
+                .header("authorization", "Bearer read-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(read_response.status(), StatusCode::OK);
+
+        let write_on_read_response = send(
+            &app,
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/capabilities")
+                .header("authorization", "Bearer write-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(write_on_read_response.status(), StatusCode::OK);
+
+        let read_on_write_response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/executions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer read-token")
+                .body(Body::from(payload.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(read_on_write_response.status(), StatusCode::UNAUTHORIZED);
+
+        let write_response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/executions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer write-token")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(write_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

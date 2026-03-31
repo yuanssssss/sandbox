@@ -39,7 +39,9 @@
 - [x] 已完成后续扩展：`sandbox-cli serve` 已支持 `--server-config`，可持久化保存鉴权和限制参数
 - [x] 已完成后续扩展：execution / judge job SSE 已统一成共享事件模型，
   客户端可按 `task_kind + event_type` 统一消费
-- [ ] 当前下一步：如果继续工程化，可优先补细粒度权限
+- [x] 已完成后续扩展：协议服务已支持细粒度 read/write token，
+  GET/HEAD 接受 read 或 write token，POST 要求 write token
+- [ ] 当前下一步：如果继续工程化，可优先补更完整的运维配置与观测
 
 ## 推荐顺序
 

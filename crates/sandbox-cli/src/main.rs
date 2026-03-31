@@ -111,6 +111,10 @@ struct ServeArgs {
     #[arg(long)]
     auth_token: Option<String>,
     #[arg(long)]
+    read_auth_token: Option<String>,
+    #[arg(long)]
+    write_auth_token: Option<String>,
+    #[arg(long)]
     max_request_body_bytes: Option<usize>,
     #[arg(long)]
     max_concurrent_requests: Option<usize>,
@@ -301,6 +305,12 @@ struct ProtocolServerFileConfig {
     auth_token: Option<String>,
     auth_token_env: Option<String>,
     auth_token_file: Option<PathBuf>,
+    read_auth_token: Option<String>,
+    read_auth_token_env: Option<String>,
+    read_auth_token_file: Option<PathBuf>,
+    write_auth_token: Option<String>,
+    write_auth_token_env: Option<String>,
+    write_auth_token_file: Option<PathBuf>,
     max_request_body_bytes: Option<usize>,
     max_concurrent_requests: Option<usize>,
 }
@@ -387,6 +397,34 @@ fn resolve_server_auth_token(
     Ok(std::env::var("SANDBOX_PROTOCOL_AUTH_TOKEN").ok())
 }
 
+fn resolve_token_source(
+    cli_value: Option<String>,
+    file_value: &Option<String>,
+    file_path: Option<&PathBuf>,
+    file_env: Option<&str>,
+    fallback_env: Option<&str>,
+) -> AnyhowResult<Option<String>> {
+    if cli_value.is_some() {
+        return Ok(cli_value);
+    }
+    if file_value.is_some() {
+        return Ok(file_value.clone());
+    }
+    if let Some(path) = file_path {
+        let token = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read auth token file {}", path.display()))?;
+        return Ok(Some(token.trim().to_string()));
+    }
+    if let Some(env_name) = file_env {
+        return Ok(std::env::var(env_name).ok());
+    }
+    if let Some(env_name) = fallback_env {
+        return Ok(std::env::var(env_name).ok());
+    }
+
+    Ok(None)
+}
+
 fn resolve_server_options(
     args: &ServeArgs,
     file_config: &ProtocolServerFileConfig,
@@ -409,6 +447,20 @@ fn resolve_server_options(
 
     Ok(ProtocolServerOptions {
         auth_token: resolve_server_auth_token(args.auth_token.clone(), file_config)?,
+        read_auth_token: resolve_token_source(
+            args.read_auth_token.clone(),
+            &file_config.read_auth_token,
+            file_config.read_auth_token_file.as_ref(),
+            file_config.read_auth_token_env.as_deref(),
+            Some("SANDBOX_PROTOCOL_READ_AUTH_TOKEN"),
+        )?,
+        write_auth_token: resolve_token_source(
+            args.write_auth_token.clone(),
+            &file_config.write_auth_token,
+            file_config.write_auth_token_file.as_ref(),
+            file_config.write_auth_token_env.as_deref(),
+            Some("SANDBOX_PROTOCOL_WRITE_AUTH_TOKEN"),
+        )?,
         max_request_body_bytes,
         max_concurrent_requests,
     })
@@ -1943,6 +1995,8 @@ max_concurrent_requests = 7
             listen: "127.0.0.1:3000".parse().unwrap(),
             server_config: Some(PathBuf::from("configs/protocol-server.toml")),
             auth_token: Some("cli-token".to_string()),
+            read_auth_token: None,
+            write_auth_token: None,
             max_request_body_bytes: Some(4096),
             max_concurrent_requests: Some(9),
         };
@@ -1950,6 +2004,12 @@ max_concurrent_requests = 7
             auth_token: Some("file-token".to_string()),
             auth_token_env: Some("IGNORED_ENV".to_string()),
             auth_token_file: None,
+            read_auth_token: None,
+            read_auth_token_env: None,
+            read_auth_token_file: None,
+            write_auth_token: None,
+            write_auth_token_env: None,
+            write_auth_token_file: None,
             max_request_body_bytes: Some(2048),
             max_concurrent_requests: Some(5),
         };
@@ -1969,6 +2029,8 @@ max_concurrent_requests = 7
             listen: "127.0.0.1:3000".parse().unwrap(),
             server_config: None,
             auth_token: None,
+            read_auth_token: None,
+            write_auth_token: None,
             max_request_body_bytes: None,
             max_concurrent_requests: None,
         };
@@ -1976,6 +2038,12 @@ max_concurrent_requests = 7
             auth_token: None,
             auth_token_env: None,
             auth_token_file: Some(token_path),
+            read_auth_token: None,
+            read_auth_token_env: None,
+            read_auth_token_file: None,
+            write_auth_token: None,
+            write_auth_token_env: None,
+            write_auth_token_file: None,
             max_request_body_bytes: None,
             max_concurrent_requests: None,
         };

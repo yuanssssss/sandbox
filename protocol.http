@@ -8,6 +8,7 @@
 # 或：cargo run -p sandbox-cli -- serve --listen 127.0.0.1:3000 --server-config configs/protocol-server.toml
 # 如果启用了鉴权，可在请求里加：
 # Authorization: Bearer secret-token
+# 如果启用了细粒度权限，GET/HEAD 可用 read 或 write token，POST 需要 write token
 
 ###
 # 健康检查

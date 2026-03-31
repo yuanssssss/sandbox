@@ -5,5 +5,17 @@
 # auth_token_env = "SANDBOX_PROTOCOL_AUTH_TOKEN"
 # auth_token_file = "/run/secrets/sandbox_protocol_token"
 
+# Optional finer-grained tokens.
+# GET/HEAD /api/v1/... routes accept read or write tokens.
+# POST /api/v1/... routes require the write token.
+#
+# read_auth_token = "replace-read-token"
+# read_auth_token_env = "SANDBOX_PROTOCOL_READ_AUTH_TOKEN"
+# read_auth_token_file = "/run/secrets/sandbox_protocol_read_token"
+#
+# write_auth_token = "replace-write-token"
+# write_auth_token_env = "SANDBOX_PROTOCOL_WRITE_AUTH_TOKEN"
+# write_auth_token_file = "/run/secrets/sandbox_protocol_write_token"
+
 max_request_body_bytes = 1048576
 max_concurrent_requests = 32
