@@ -240,6 +240,12 @@ curl -sS http://127.0.0.1:3000/api/v1/executions/async \
   }'
 ```
 
+当前异步任务策略：
+
+- `completed` / `failed` 任务默认保留 5 分钟
+- 最多保留 1024 条异步执行任务
+- 超出上限时会返回 `429 task_capacity_exceeded`
+
 返回 `task_id` 后查询状态：
 
 ```bash

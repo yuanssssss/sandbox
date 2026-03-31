@@ -520,6 +520,7 @@ Accept: application/json
 ###
 # 异步执行：创建任务
 # 如果你的 HTTP client 支持脚本，这里会自动把 task_id 写入 {{taskId}}
+# 默认 completed/failed 任务保留 5 分钟，最多保留 1024 条；超限时返回 429 task_capacity_exceeded
 POST {{baseUrl}}/api/v1/executions/async
 Content-Type: application/json
 Accept: application/json

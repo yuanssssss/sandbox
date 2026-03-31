@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, Query};
@@ -671,6 +672,17 @@ fn task_not_found_error(task_id: &str) -> ProtocolError {
         "not_found",
         format!("execution task `{task_id}` was not found"),
         None,
+    )
+}
+
+fn async_task_capacity_exceeded_error(max_tasks: usize, request_id: &str) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "task_capacity_exceeded",
+        format!(
+            "async execution task capacity exceeded: at most {max_tasks} retained tasks are allowed"
+        ),
+        Some(request_id.to_string()),
     )
 }
 
@@ -1519,7 +1531,29 @@ fn error_detail_from_protocol_error(
 struct ExecutionTaskManager<B> {
     backend: Arc<B>,
     next_task_id: AtomicU64,
-    tasks: Arc<RwLock<HashMap<String, ExecutionTaskResponse>>>,
+    retention: AsyncTaskRetentionPolicy,
+    tasks: Arc<RwLock<HashMap<String, StoredExecutionTask>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AsyncTaskRetentionPolicy {
+    completed_ttl: Duration,
+    max_tasks: usize,
+}
+
+impl Default for AsyncTaskRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            completed_ttl: Duration::from_secs(5 * 60),
+            max_tasks: 1_024,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoredExecutionTask {
+    response: ExecutionTaskResponse,
+    completed_at: Option<Instant>,
 }
 
 impl<B> ExecutionTaskManager<B>
@@ -1527,9 +1561,14 @@ where
     B: ProtocolBackend,
 {
     fn new(backend: Arc<B>) -> Self {
+        Self::with_policy(backend, AsyncTaskRetentionPolicy::default())
+    }
+
+    fn with_policy(backend: Arc<B>, retention: AsyncTaskRetentionPolicy) -> Self {
         Self {
             backend,
             next_task_id: AtomicU64::new(1),
+            retention,
             tasks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -1558,19 +1597,32 @@ where
             status: ExecutionTaskStatus::Accepted,
         };
 
-        self.tasks.write().await.insert(
+        let mut tasks = self.tasks.write().await;
+        prune_expired_tasks_locked(&mut tasks, self.retention, Instant::now());
+        if tasks.len() >= self.retention.max_tasks {
+            return Err(async_task_capacity_exceeded_error(
+                self.retention.max_tasks,
+                &request_id,
+            ));
+        }
+        tasks.insert(
             task_id.clone(),
-            ExecutionTaskResponse {
-                task_id: task_id.clone(),
-                request_id: request_id.clone(),
-                status: ExecutionTaskStatus::Accepted,
-                report: None,
-                error: None,
+            StoredExecutionTask {
+                response: ExecutionTaskResponse {
+                    task_id: task_id.clone(),
+                    request_id: request_id.clone(),
+                    status: ExecutionTaskStatus::Accepted,
+                    report: None,
+                    error: None,
+                },
+                completed_at: None,
             },
         );
+        drop(tasks);
 
         let backend = Arc::clone(&self.backend);
         let tasks = Arc::clone(&self.tasks);
+        let retention = self.retention;
         tokio::spawn(async move {
             update_task_status(&tasks, &task_id, ExecutionTaskStatus::Running, None, None).await;
             match backend.execute(request).await {
@@ -1596,13 +1648,23 @@ where
                     .await;
                 }
             }
+            prune_expired_tasks_with_policy(&tasks, retention).await;
         });
 
         Ok(accepted)
     }
 
     async fn get(&self, task_id: &str) -> Option<ExecutionTaskResponse> {
-        self.tasks.read().await.get(task_id).cloned()
+        self.prune_expired_tasks().await;
+        self.tasks
+            .read()
+            .await
+            .get(task_id)
+            .map(|task| task.response.clone())
+    }
+
+    async fn prune_expired_tasks(&self) {
+        prune_expired_tasks_with_policy(&self.tasks, self.retention).await;
     }
 }
 
@@ -1631,7 +1693,7 @@ impl JudgeJobStore {
 }
 
 async fn update_task_status(
-    tasks: &RwLock<HashMap<String, ExecutionTaskResponse>>,
+    tasks: &RwLock<HashMap<String, StoredExecutionTask>>,
     task_id: &str,
     status: ExecutionTaskStatus,
     report: Option<ExecutionReport>,
@@ -1639,10 +1701,36 @@ async fn update_task_status(
 ) {
     let mut guard = tasks.write().await;
     if let Some(task) = guard.get_mut(task_id) {
-        task.status = status;
-        task.report = report;
-        task.error = error;
+        task.response.status = status;
+        task.response.report = report;
+        task.response.error = error;
+        task.completed_at = matches!(
+            status,
+            ExecutionTaskStatus::Completed | ExecutionTaskStatus::Failed
+        )
+        .then_some(Instant::now());
     }
+}
+
+async fn prune_expired_tasks_with_policy(
+    tasks: &RwLock<HashMap<String, StoredExecutionTask>>,
+    retention: AsyncTaskRetentionPolicy,
+) {
+    let now = Instant::now();
+    let mut guard = tasks.write().await;
+    prune_expired_tasks_locked(&mut guard, retention, now);
+}
+
+fn prune_expired_tasks_locked(
+    tasks: &mut HashMap<String, StoredExecutionTask>,
+    retention: AsyncTaskRetentionPolicy,
+    now: Instant,
+) {
+    tasks.retain(|_, task| {
+        task.completed_at
+            .map(|completed_at| now.duration_since(completed_at) < retention.completed_ttl)
+            .unwrap_or(true)
+    });
 }
 
 pub fn build_router<B>(backend: B) -> Router
@@ -2004,7 +2092,8 @@ mod tests {
     use serde::de::DeserializeOwned;
     use std::fs;
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
     use tower::util::ServiceExt;
 
@@ -2272,6 +2361,15 @@ enable_rootfs = false
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("sandbox-protocol-{prefix}-{stamp}"))
+    }
+
+    fn sample_execution_request(request_id: &str) -> ExecutionRequest {
+        ExecutionRequest {
+            request_id: request_id.to_string(),
+            config: sample_config(),
+            command_override: None,
+            artifact_dir: None,
+        }
     }
 
     async fn response_json<T: DeserializeOwned>(response: Response) -> T {
@@ -3158,6 +3256,106 @@ enable_rootfs = false
         }
 
         panic!("async execution task did not fail in time");
+    }
+
+    #[tokio::test]
+    async fn async_task_manager_prunes_completed_tasks_after_ttl() {
+        let backend = Arc::new(GatedBackend::success());
+        let manager = ExecutionTaskManager::with_policy(
+            Arc::clone(&backend),
+            AsyncTaskRetentionPolicy {
+                completed_ttl: Duration::from_millis(20),
+                max_tasks: 4,
+            },
+        );
+
+        let accepted = manager
+            .submit(sample_execution_request("async-expire-001"))
+            .await
+            .expect("submission should succeed");
+        backend.started.notified().await;
+        backend.gate.notify_waiters();
+
+        for _ in 0..20 {
+            if manager
+                .get(&accepted.task_id)
+                .await
+                .is_some_and(|task| task.status == ExecutionTaskStatus::Completed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        thread::sleep(Duration::from_millis(30));
+        assert!(manager.get(&accepted.task_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn async_task_manager_rejects_new_submissions_when_capacity_is_reached() {
+        let backend = Arc::new(GatedBackend::success());
+        let manager = ExecutionTaskManager::with_policy(
+            Arc::clone(&backend),
+            AsyncTaskRetentionPolicy {
+                completed_ttl: Duration::from_secs(60),
+                max_tasks: 1,
+            },
+        );
+
+        let _accepted = manager
+            .submit(sample_execution_request("async-capacity-001"))
+            .await
+            .expect("first submission should succeed");
+        backend.started.notified().await;
+
+        let error = manager
+            .submit(sample_execution_request("async-capacity-002"))
+            .await
+            .expect_err("second submission should be rejected");
+
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.code, "task_capacity_exceeded");
+        assert_eq!(error.request_id.as_deref(), Some("async-capacity-002"));
+
+        backend.gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn async_task_manager_accepts_new_submissions_after_expired_cleanup() {
+        let backend = Arc::new(GatedBackend::success());
+        let manager = ExecutionTaskManager::with_policy(
+            Arc::clone(&backend),
+            AsyncTaskRetentionPolicy {
+                completed_ttl: Duration::from_millis(20),
+                max_tasks: 1,
+            },
+        );
+
+        let accepted = manager
+            .submit(sample_execution_request("async-reuse-001"))
+            .await
+            .expect("first submission should succeed");
+        backend.started.notified().await;
+        backend.gate.notify_waiters();
+
+        for _ in 0..20 {
+            if manager
+                .get(&accepted.task_id)
+                .await
+                .is_some_and(|task| task.status == ExecutionTaskStatus::Completed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        thread::sleep(Duration::from_millis(30));
+
+        let accepted_second = manager
+            .submit(sample_execution_request("async-reuse-002"))
+            .await
+            .expect("expired task should have been cleaned up");
+        assert_ne!(accepted.task_id, accepted_second.task_id);
     }
 
     #[tokio::test]
