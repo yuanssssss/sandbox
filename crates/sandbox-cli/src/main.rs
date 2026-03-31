@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -7,6 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sandbox_cgroup::{CgroupManager, CgroupPlan};
 use sandbox_config::ExecutionConfig;
 use sandbox_core::{ExecutionResult, ExecutionStatus, SandboxError};
+use sandbox_protocol::serve as serve_protocol;
 use sandbox_supervisor::{
     NamespaceSupport, RunOptions, cgroup_scope_name, planned_artifact_dir, probe_namespace_support,
     rootfs_cwd, run,
@@ -38,6 +40,7 @@ enum Commands {
     Validate(ValidateArgs),
     Inspect(InspectArgs),
     Debug(DebugArgs),
+    Serve(ServeArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -78,6 +81,12 @@ struct DebugArgs {
     artifact_dir: Option<PathBuf>,
     #[arg(long, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+struct ServeArgs {
+    #[arg(long, default_value = "127.0.0.1:3000")]
+    listen: SocketAddr,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -261,7 +270,11 @@ struct DebugReport {
 }
 
 fn main() {
-    let exit_code = match try_main() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("creating tokio runtime should succeed");
+    let exit_code = match runtime.block_on(try_main()) {
         Ok(code) => code,
         Err(report) => {
             print_cli_error_report(&report);
@@ -272,7 +285,7 @@ fn main() {
     process::exit(exit_code);
 }
 
-fn try_main() -> std::result::Result<i32, CliErrorReport> {
+async fn try_main() -> std::result::Result<i32, CliErrorReport> {
     let cli = Cli::parse();
     let error_format = cli_error_format(&cli);
     init_tracing(&cli).map_err(|err| build_error_report("startup", &err, error_format))?;
@@ -282,6 +295,7 @@ fn try_main() -> std::result::Result<i32, CliErrorReport> {
         Commands::Validate(args) => validate_command(args),
         Commands::Inspect(args) => inspect_command(args),
         Commands::Debug(args) => debug_command(args),
+        Commands::Serve(args) => serve_command(args).await,
     }
 }
 
@@ -289,7 +303,7 @@ fn cli_error_format(cli: &Cli) -> ResultFormat {
     match &cli.command {
         Commands::Run(args) => args.result_format,
         Commands::Inspect(args) => args.result_format,
-        Commands::Validate(_) | Commands::Debug(_) => ResultFormat::Pretty,
+        Commands::Validate(_) | Commands::Debug(_) | Commands::Serve(_) => ResultFormat::Pretty,
     }
 }
 
@@ -400,6 +414,14 @@ fn debug_command(args: DebugArgs) -> std::result::Result<i32, CliErrorReport> {
             Ok(exit_code)
         }
     }
+}
+
+async fn serve_command(args: ServeArgs) -> std::result::Result<i32, CliErrorReport> {
+    serve_protocol(args.listen)
+        .await
+        .with_context(|| format!("failed to serve sandbox protocol on {}", args.listen))
+        .map_err(|err| build_error_report("serve", &err, ResultFormat::Pretty))?;
+    Ok(0)
 }
 
 fn execute_run(
@@ -909,16 +931,19 @@ fn render_pretty_result(result: &ExecutionResult) -> String {
         format!("outcome: {}", run_outcome_label(&result.status)),
         format!("summary: {}", run_summary(result)),
         format!("command: {:?}", result.command),
-        format!("exit_code: {}", format_optional_i32(result.exit_code)),
-        format!("term_signal: {}", format_optional_i32(result.term_signal)),
+        format!("exit_code: {}", format_result_exit_code(result)),
+        format!(
+            "term_signal: {}",
+            format_result_term_signal(result.term_signal)
+        ),
         format!("wall_time_ms: {}", result.usage.wall_time_ms),
         format!(
             "cpu_time_ms: {}",
-            format_optional_u64(result.usage.cpu_time_ms)
+            format_result_measurement(result.usage.cpu_time_ms)
         ),
         format!(
             "memory_peak_bytes: {}",
-            format_optional_u64(result.usage.memory_peak_bytes)
+            format_result_measurement(result.usage.memory_peak_bytes)
         ),
         format!("stdout: {}", result.stdout_path.display()),
         format!("stderr: {}", result.stderr_path.display()),
@@ -1228,12 +1253,33 @@ fn cgroup_limits_enabled(limits: &sandbox_core::ResourceLimits) -> bool {
     limits.cpu_time_ms.is_some() || limits.memory_bytes.is_some() || limits.max_processes.is_some()
 }
 
+fn format_result_exit_code(result: &ExecutionResult) -> String {
+    match (result.exit_code, result.term_signal) {
+        (Some(code), _) => code.to_string(),
+        (None, Some(_)) => "none (terminated by signal)".to_string(),
+        (None, None) => "none".to_string(),
+    }
+}
+
+fn format_result_term_signal(value: Option<i32>) -> String {
+    value
+        .map(|current| current.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn format_result_measurement(value: Option<u64>) -> String {
+    value
+        .map(|current| current.to_string())
+        .unwrap_or_else(|| "not collected".to_string())
+}
+
 fn format_optional_u64(value: Option<u64>) -> String {
     value
         .map(|current| current.to_string())
         .unwrap_or_else(|| "n/a".to_string())
 }
 
+#[cfg(test)]
 fn format_optional_i32(value: Option<i32>) -> String {
     value
         .map(|current| current.to_string())
@@ -1247,9 +1293,10 @@ mod tests {
 
     use super::{
         CliErrorCategory, DebugReport, ResultFormat, build_error_report, build_inspect_report,
-        cgroup_limits_enabled, format_optional_i32, format_optional_u64, print_validate_summary,
-        render_pretty_debug_report, render_pretty_error_report, render_pretty_inspect_report,
-        render_pretty_result, run_outcome_label, status_label,
+        cgroup_limits_enabled, format_optional_i32, format_optional_u64, format_result_measurement,
+        format_result_term_signal, print_validate_summary, render_pretty_debug_report,
+        render_pretty_error_report, render_pretty_inspect_report, render_pretty_result,
+        run_outcome_label, status_label,
     };
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{
@@ -1260,6 +1307,8 @@ mod tests {
     fn formats_missing_numeric_fields_as_na() {
         assert_eq!(format_optional_u64(None), "n/a");
         assert_eq!(format_optional_i32(None), "n/a");
+        assert_eq!(format_result_term_signal(None), "none");
+        assert_eq!(format_result_measurement(None), "not collected");
     }
 
     #[test]
@@ -1406,6 +1455,8 @@ mod tests {
         assert!(rendered.contains("outcome: payload_runtime_failure"));
         assert!(rendered.contains("summary: payload exited with non-zero status 42"));
         assert!(rendered.contains("suggestion: Inspect the payload stderr/stdout artifacts"));
+        assert!(rendered.contains("term_signal: none"));
+        assert!(rendered.contains("cpu_time_ms: not collected"));
     }
 
     #[test]

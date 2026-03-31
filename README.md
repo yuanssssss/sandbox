@@ -16,12 +16,18 @@
 - 统一错误类型与执行结果模型
 - TOML 配置解析与校验
 - `tracing` 日志初始化
-- CLI 入口：`run` / `validate`
+- CLI 入口：`run` / `validate` / `inspect` / `debug` / `serve`
 - 最小 supervisor：
   - 启动子进程
   - 输出重定向到产物目录
   - wall-clock 超时
   - 按进程组发送 `SIGTERM` / `SIGKILL` 回收
+- `sandbox-protocol` HTTP transport：
+  - 已暴露 `GET /healthz`、`GET /api/v1/capabilities`
+  - 已暴露 `POST /api/v1/config/validate` 与同步执行接口 `POST /api/v1/executions`
+  - 已补兼容现有同步接口的异步执行接口 `POST /api/v1/executions/async`
+  - 已补 `GET /api/v1/executions/{task_id}` 任务状态查询
+  - 已统一协议层错误响应，包括配置错误、JSON 解析错误、`404`、`405`
 - `M2` rootfs scaffold：
   - 在产物目录下准备最小 rootfs 目录结构
   - 生成只读运行库、`/work`、`/tmp`、`/proc` 的挂载计划
@@ -55,6 +61,7 @@
   - 已在 `sandbox-testkit` 中补恶意样例与压力场景 catalog，见 `docs/malicious_sample_catalog.md`
   - 已补本地回归脚本 `scripts/run_regression_suite.sh` 与 GitHub Actions `regression.yml`
   - 已补压力脚本 `scripts/run_stress_suite.sh`、工作流 `stress.yml`，并生成基线报告 `docs/stress_test_report.md`
+  - 已补上线前安全评审清单 `docs/security_review_checklist.md`，覆盖人工审查项、发布前命令检查与上线证据留档
 
 ## Workspace 结构
 
@@ -102,6 +109,39 @@ cargo run -p sandbox-cli -- inspect --config configs/strict.toml
 cargo run -p sandbox-cli -- debug --config configs/minimal.toml
 ```
 
+启动 HTTP API：
+
+```bash
+cargo run -p sandbox-cli -- serve --listen 127.0.0.1:3000
+```
+
+## Docker 环境
+
+仓库根目录现在提供了两套容器环境：
+
+- 开发环境镜像：`docker/dev.Dockerfile`
+  - 适合在容器里改代码、编译、跑测试
+  - 内置 Rust 工具链，以及 C/C++、Java、Python 的编译和运行依赖
+- 发布环境镜像：`docker/prod.Dockerfile`
+  - 多阶段构建，最终镜像默认启动 `sandbox-cli serve --listen 0.0.0.0:3000`
+  - 同样包含 C/C++、Java、Python 的编译和运行依赖，便于在容器内执行多语言 payload
+
+根目录 `Makefile` 提供了常用命令：
+
+```bash
+make docker-build-dev
+make docker-shell-dev
+make docker-build-prod
+make docker-run-prod
+make docker-shell-prod
+```
+
+其中：
+
+- `docker-shell-dev` 会自动创建或启动开发容器，并把当前仓库挂到 `/workspace`
+- `docker-run-prod` 会启动发布容器并映射 `3000` 端口
+- 由于这个项目依赖 namespace、cgroup 和 seccomp，容器运行参数里默认包含 `--privileged` 和 `/sys/fs/cgroup` 挂载
+
 运行本地回归：
 
 ```bash
@@ -119,6 +159,78 @@ cargo run -p sandbox-cli -- debug --config configs/minimal.toml
 - `validate` 只检查配置并打印摘要
 - `inspect` 不执行 payload，只展示 artifact、rootfs、cgroup、readonly input 映射和 namespace 可用性
 - `debug` 会先打印 `inspect` 信息，再实际执行 payload，适合定位 mount/cgroup/setup 失败
+- `serve` 启动 `sandbox-protocol` 的 HTTP 服务，默认监听 `127.0.0.1:3000`
+
+## HTTP API
+
+启动服务后，可使用下面这些接口：
+
+- `GET /healthz`
+- `GET /api/v1/capabilities`
+- `POST /api/v1/config/validate`
+- `POST /api/v1/executions`
+- `POST /api/v1/executions/async`
+- `GET /api/v1/executions/{task_id}`
+
+同步执行示例：
+
+```bash
+curl -sS http://127.0.0.1:3000/api/v1/executions \
+  -H 'content-type: application/json' \
+  -d '{
+    "request_id": "run-001",
+    "config": {
+      "process": {
+        "argv": ["/bin/echo", "hello"]
+      },
+      "limits": {
+        "wall_time_ms": 1000
+      },
+      "filesystem": {
+        "enable_rootfs": false
+      }
+    }
+  }'
+```
+
+异步执行示例：
+
+```bash
+curl -sS http://127.0.0.1:3000/api/v1/executions/async \
+  -H 'content-type: application/json' \
+  -d '{
+    "request_id": "run-async-001",
+    "config": {
+      "process": {
+        "argv": ["/bin/echo", "hello"]
+      },
+      "limits": {
+        "wall_time_ms": 1000
+      },
+      "filesystem": {
+        "enable_rootfs": false
+      }
+    }
+  }'
+```
+
+返回 `task_id` 后查询状态：
+
+```bash
+curl -sS http://127.0.0.1:3000/api/v1/executions/exec-1
+```
+
+错误响应统一为：
+
+```json
+{
+  "error": {
+    "code": "configuration",
+    "message": "configuration error: ...",
+    "request_id": "run-001"
+  }
+}
+```
 
 当前仓库提供两套模板：
 
@@ -147,10 +259,9 @@ cargo run -p sandbox-cli -- run --config configs/minimal.toml --command /bin/ech
 
 优先继续做这些任务：
 
-1. 完成 `T047` 的上线前安全评审清单
-2. 继续补编译阶段、checker 分层和 Unix domain socket 相关攻击样例
-3. 继续扩真实 cgroup v2 / namespace 特权环境下的压力基线
-4. 视威胁模型再补更细的 seccomp 与 LSM/微虚拟机路线
+1. 继续补编译阶段、checker 分层和 Unix domain socket 相关攻击样例
+2. 继续扩真实 cgroup v2 / namespace 特权环境下的压力基线
+3. 视威胁模型再补更细的 seccomp 与 LSM/微虚拟机路线
 
 ## 验证
 
