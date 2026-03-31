@@ -1,5 +1,5 @@
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, File};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -11,8 +11,10 @@ pub struct RootfsLayout {
     pub root: PathBuf,
     pub host_work_dir: PathBuf,
     pub host_tmp_dir: PathBuf,
+    pub host_output_dir: Option<PathBuf>,
     pub sandbox_work_dir: PathBuf,
     pub sandbox_tmp_dir: PathBuf,
+    pub sandbox_output_dir: Option<PathBuf>,
     pub sandbox_proc_dir: Option<PathBuf>,
 }
 
@@ -62,6 +64,9 @@ pub fn cleanup_rootfs_artifacts(plan: &RootfsPlan) -> Result<()> {
         &plan.layout.host_tmp_dir,
         "removing stale host tmp directory",
     )?;
+    if let Some(host_output_dir) = &plan.layout.host_output_dir {
+        cleanup_path(host_output_dir, "removing stale host output directory")?;
+    }
     Ok(())
 }
 
@@ -81,8 +86,13 @@ pub fn prepare_rootfs(config: &FilesystemConfig, artifact_dir: &Path) -> Result<
             .unwrap_or_else(|| artifact_dir.join("rootfs")),
         host_work_dir: artifact_dir.join("work"),
         host_tmp_dir: artifact_dir.join("tmp"),
+        host_output_dir: config
+            .output_dir
+            .as_ref()
+            .map(|_| artifact_dir.join("outputs")),
         sandbox_work_dir: config.work_dir.clone(),
         sandbox_tmp_dir: config.tmp_dir.clone(),
+        sandbox_output_dir: config.output_dir.clone(),
         sandbox_proc_dir: config.mount_proc.then(|| PathBuf::from("/proc")),
     };
 
@@ -102,7 +112,7 @@ pub fn prepare_rootfs(config: &FilesystemConfig, artifact_dir: &Path) -> Result<
                 target: source.clone(),
                 flags: vec!["ro".into(), "rbind".into()],
             });
-            materialize_mount_target(&layout.root, source)?;
+            materialize_bind_mount_target(&layout.root, source, source)?;
         }
     }
 
@@ -114,7 +124,19 @@ pub fn prepare_rootfs(config: &FilesystemConfig, artifact_dir: &Path) -> Result<
                 target: source.clone(),
                 flags: vec!["ro".into(), "rbind".into()],
             });
-            materialize_mount_target(&layout.root, source)?;
+            materialize_bind_mount_target(&layout.root, source, source)?;
+        }
+    }
+
+    for source in &config.readonly_bind_paths {
+        if source.exists() {
+            mounts.push(MountPlanEntry {
+                kind: MountKind::BindReadOnly,
+                source: Some(source.clone()),
+                target: source.clone(),
+                flags: vec!["ro".into(), "rbind".into()],
+            });
+            materialize_bind_mount_target(&layout.root, source, source)?;
         }
     }
 
@@ -125,6 +147,18 @@ pub fn prepare_rootfs(config: &FilesystemConfig, artifact_dir: &Path) -> Result<
         flags: vec!["rw".into(), "rbind".into(), "nodev".into(), "nosuid".into()],
     });
     materialize_mount_target(&layout.root, &layout.sandbox_work_dir)?;
+
+    if let (Some(host_output_dir), Some(sandbox_output_dir)) =
+        (&layout.host_output_dir, &layout.sandbox_output_dir)
+    {
+        mounts.push(MountPlanEntry {
+            kind: MountKind::BindReadWrite,
+            source: Some(host_output_dir.clone()),
+            target: sandbox_output_dir.clone(),
+            flags: vec!["rw".into(), "rbind".into(), "nodev".into(), "nosuid".into()],
+        });
+        materialize_mount_target(&layout.root, sandbox_output_dir)?;
+    }
 
     mounts.push(MountPlanEntry {
         kind: MountKind::Tmpfs,
@@ -254,9 +288,16 @@ fn materialize_rootfs_layout(layout: &RootfsLayout) -> Result<()> {
         .map_err(|err| SandboxError::io("creating host work directory", err))?;
     fs::create_dir_all(&layout.host_tmp_dir)
         .map_err(|err| SandboxError::io("creating host tmp directory", err))?;
+    if let Some(host_output_dir) = &layout.host_output_dir {
+        fs::create_dir_all(host_output_dir)
+            .map_err(|err| SandboxError::io("creating host output directory", err))?;
+    }
 
     materialize_mount_target(&layout.root, &layout.sandbox_work_dir)?;
     materialize_mount_target(&layout.root, &layout.sandbox_tmp_dir)?;
+    if let Some(sandbox_output_dir) = &layout.sandbox_output_dir {
+        materialize_mount_target(&layout.root, sandbox_output_dir)?;
+    }
     if let Some(proc_dir) = &layout.sandbox_proc_dir {
         materialize_mount_target(&layout.root, proc_dir)?;
     }
@@ -290,6 +331,25 @@ fn materialize_mount_target(root: &Path, sandbox_path: &Path) -> Result<()> {
     let target = host_mount_target(root, sandbox_path)?;
     fs::create_dir_all(&target)
         .map_err(|err| SandboxError::io("creating rootfs mount target", err))?;
+    Ok(())
+}
+
+fn materialize_bind_mount_target(root: &Path, sandbox_path: &Path, source: &Path) -> Result<()> {
+    let target = host_mount_target(root, sandbox_path)?;
+    if source.is_dir() {
+        fs::create_dir_all(&target)
+            .map_err(|err| SandboxError::io("creating rootfs bind mount target", err))?;
+        return Ok(());
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| SandboxError::io("creating rootfs bind mount parent", err))?;
+    }
+    if !target.exists() {
+        File::create(&target)
+            .map_err(|err| SandboxError::io("creating rootfs bind mount file target", err))?;
+    }
     Ok(())
 }
 
@@ -453,7 +513,8 @@ mod tests {
     use sandbox_config::FilesystemConfig;
 
     use crate::{
-        MountKind, RootfsPlan, cleanup_rootfs_artifacts, host_mount_target, prepare_rootfs,
+        MountKind, RootfsPlan, cleanup_rootfs_artifacts, host_mount_target,
+        materialize_bind_mount_target, prepare_rootfs,
     };
 
     #[test]
@@ -467,6 +528,8 @@ mod tests {
         assert!(plan.layout.host_work_dir.exists());
         assert!(plan.layout.root.join("work").exists());
         assert!(plan.layout.root.join("tmp").exists());
+        assert_eq!(plan.layout.host_output_dir, None);
+        assert_eq!(plan.layout.sandbox_output_dir, None);
         assert!(
             plan.mounts
                 .iter()
@@ -497,6 +560,40 @@ mod tests {
     }
 
     #[test]
+    fn includes_readonly_input_and_output_mounts_in_plan() {
+        let artifact_dir = unique_dir("io-policy");
+        let input_path = unique_dir("readonly-input").join("input.txt");
+        fs::create_dir_all(input_path.parent().expect("parent should exist"))
+            .expect("input parent should exist");
+        fs::write(&input_path, "input").expect("input file should exist");
+        let config = FilesystemConfig {
+            readonly_bind_paths: vec![input_path.clone()],
+            output_dir: Some(PathBuf::from("/output")),
+            ..FilesystemConfig::default()
+        };
+
+        let plan = prepare_rootfs(&config, &artifact_dir).expect("rootfs scaffold should build");
+
+        assert_eq!(
+            plan.layout.sandbox_output_dir,
+            Some(PathBuf::from("/output"))
+        );
+        assert_eq!(
+            plan.layout.host_output_dir,
+            Some(artifact_dir.join("outputs"))
+        );
+        assert!(plan.mounts.iter().any(|mount| mount.source.as_deref()
+            == Some(input_path.as_path())
+            && mount.kind == MountKind::BindReadOnly));
+        assert!(
+            plan.mounts
+                .iter()
+                .any(|mount| mount.target == PathBuf::from("/output")
+                    && mount.kind == MountKind::BindReadWrite)
+        );
+    }
+
+    #[test]
     fn rejects_disabled_rootfs() {
         let artifact_dir = unique_dir("disabled");
         let config = FilesystemConfig {
@@ -517,6 +614,21 @@ mod tests {
     }
 
     #[test]
+    fn materializes_file_bind_target_as_file() {
+        let artifact_dir = unique_dir("file-bind-target");
+        let source_dir = unique_dir("file-bind-source");
+        fs::create_dir_all(&source_dir).expect("source dir should exist");
+        let source = source_dir.join("input.txt");
+        fs::write(&source, "hello").expect("source file should exist");
+
+        materialize_bind_mount_target(&artifact_dir, Path::new("/inputs/input.txt"), &source)
+            .expect("file target should materialize");
+
+        let target = artifact_dir.join("inputs/input.txt");
+        assert!(target.is_file());
+    }
+
+    #[test]
     fn cleans_up_existing_rootfs_artifacts() {
         let artifact_dir = unique_dir("cleanup");
         let plan = RootfsPlan {
@@ -524,8 +636,10 @@ mod tests {
                 root: artifact_dir.join("rootfs"),
                 host_work_dir: artifact_dir.join("work"),
                 host_tmp_dir: artifact_dir.join("tmp"),
+                host_output_dir: None,
                 sandbox_work_dir: PathBuf::from("/work"),
                 sandbox_tmp_dir: PathBuf::from("/tmp"),
+                sandbox_output_dir: None,
                 sandbox_proc_dir: Some(PathBuf::from("/proc")),
             },
             mounts: Vec::new(),

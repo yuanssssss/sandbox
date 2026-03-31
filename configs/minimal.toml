@@ -32,6 +32,8 @@ drop_capabilities = true
 work_dir = "/work"
 tmp_dir = "/tmp"
 executable_bind_paths = ["/bin", "/usr/bin"]
+# readonly_bind_paths = ["/abs/path/to/input.txt"]
+# output_dir = "/output"
 
 # 更强隔离示例：
 # enter_user_namespace = true

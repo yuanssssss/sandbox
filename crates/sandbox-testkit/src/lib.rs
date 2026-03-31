@@ -9,6 +9,8 @@ pub enum Scenario {
     NetworkIsolationProbe,
     IpcIsolationProbe,
     UserNamespaceProbe,
+    ReadonlyInputProbe,
+    WritableOutputProbe,
 }
 
 impl Scenario {
@@ -27,6 +29,12 @@ impl Scenario {
                 "test -r /proc/sysvipc/shm && test $(wc -l < /proc/sysvipc/shm) -le 1 && test -r /proc/sysvipc/msg && test $(wc -l < /proc/sysvipc/msg) -le 1 && test -r /proc/sysvipc/sem && test $(wc -l < /proc/sysvipc/sem) -le 1"
             }
             Self::UserNamespaceProbe => "id -u && id -g",
+            Self::ReadonlyInputProbe => {
+                "cat /inputs/input.txt && ! printf 'tamper' >> /inputs/input.txt"
+            }
+            Self::WritableOutputProbe => {
+                "printf 'result' > /output/result.txt && cat /output/result.txt"
+            }
         }
     }
 }

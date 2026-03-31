@@ -173,6 +173,14 @@ fn print_validate_summary(config: &ExecutionConfig, config_path: &PathBuf) {
     println!("work_dir: {}", filesystem.work_dir.display());
     println!("tmp_dir: {}", filesystem.tmp_dir.display());
     println!(
+        "output_dir: {}",
+        filesystem
+            .output_dir
+            .as_ref()
+            .map(|value| value.display().to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    println!(
         "artifact_dir: {}",
         config
             .io
@@ -188,6 +196,19 @@ fn print_validate_summary(config: &ExecutionConfig, config_path: &PathBuf) {
         } else {
             filesystem
                 .executable_bind_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    println!(
+        "readonly_bind_paths: {}",
+        if filesystem.readonly_bind_paths.is_empty() {
+            "[]".to_string()
+        } else {
+            filesystem
+                .readonly_bind_paths
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()

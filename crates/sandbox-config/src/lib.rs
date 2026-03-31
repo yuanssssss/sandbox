@@ -164,6 +164,9 @@ pub struct FilesystemConfig {
     pub runtime_bind_paths: Vec<PathBuf>,
     #[serde(default)]
     pub executable_bind_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub readonly_bind_paths: Vec<PathBuf>,
+    pub output_dir: Option<PathBuf>,
     #[serde(default = "default_mount_proc")]
     pub mount_proc: bool,
 }
@@ -190,6 +193,8 @@ impl Default for FilesystemConfig {
             tmp_dir: default_tmp_dir(),
             runtime_bind_paths: default_runtime_bind_paths(),
             executable_bind_paths: Vec::new(),
+            readonly_bind_paths: Vec::new(),
+            output_dir: None,
             mount_proc: default_mount_proc(),
         }
     }
@@ -266,6 +271,24 @@ impl FilesystemConfig {
             if !path.is_absolute() {
                 return Err(SandboxError::config(format!(
                     "filesystem.executable_bind_paths must contain absolute paths: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        for path in &self.readonly_bind_paths {
+            if !path.is_absolute() {
+                return Err(SandboxError::config(format!(
+                    "filesystem.readonly_bind_paths must contain absolute paths: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        if let Some(path) = &self.output_dir {
+            if !path.is_absolute() {
+                return Err(SandboxError::config(format!(
+                    "filesystem.output_dir must be an absolute path: {}",
                     path.display()
                 )));
             }
@@ -424,6 +447,8 @@ mod tests {
         assert!(config.filesystem.mount_proc);
         assert_eq!(config.filesystem.runtime_bind_paths.len(), 3);
         assert!(config.filesystem.executable_bind_paths.is_empty());
+        assert!(config.filesystem.readonly_bind_paths.is_empty());
+        assert_eq!(config.filesystem.output_dir, None);
     }
 
     #[test]
@@ -452,6 +477,34 @@ mod tests {
 
         let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
         assert!(err.to_string().contains("executable_bind_paths"));
+    }
+
+    #[test]
+    fn rejects_relative_readonly_bind_path() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            readonly_bind_paths = ["inputs/data.txt"]
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("readonly_bind_paths"));
+    }
+
+    #[test]
+    fn rejects_relative_output_dir() {
+        let raw = r#"
+            [process]
+            argv = ["/bin/echo", "hello"]
+
+            [filesystem]
+            output_dir = "outputs"
+        "#;
+
+        let err = ExecutionConfig::from_toml_str(raw).expect_err("config should fail");
+        assert!(err.to_string().contains("output_dir"));
     }
 
     #[test]

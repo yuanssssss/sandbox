@@ -70,6 +70,8 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
         config.io.stderr_path.as_deref(),
         "stderr.log",
     );
+    assert_path_is_within(&artifact_dir, &stdout_path)?;
+    assert_path_is_within(&artifact_dir, &stderr_path)?;
     create_parent_dir(&stdout_path)?;
     create_parent_dir(&stderr_path)?;
 
@@ -855,6 +857,16 @@ fn default_artifact_dir() -> PathBuf {
     PathBuf::from(".sandbox-runs").join(format!("run-{millis}"))
 }
 
+fn assert_path_is_within(base: &Path, path: &Path) -> Result<()> {
+    if !path.starts_with(base) {
+        return Err(SandboxError::config(format!(
+            "configured path must stay within artifact directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 struct WaitOutcome {
     exit_status: ExitStatus,
     elapsed: Duration,
@@ -1078,6 +1090,39 @@ mod tests {
         assert!(artifact_dir.join("rootfs/tmp").exists());
         assert!(artifact_dir.join("rootfs/proc").exists());
         assert!(artifact_dir.join("work").exists());
+    }
+
+    #[test]
+    fn rejects_output_paths_outside_artifact_dir() {
+        let artifact_dir = unique_artifact_dir("output-guard");
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [io]
+                stdout_path = "/tmp/escaped-stdout.log"
+            "#,
+        )
+        .expect("config should parse");
+
+        let err = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir),
+                cgroup_root_override: None,
+            },
+        )
+        .expect_err("run should fail");
+
+        assert!(
+            err.to_string()
+                .contains("configured path must stay within artifact directory")
+        );
     }
 
     #[test]
@@ -1343,6 +1388,68 @@ mod tests {
 
         assert_eq!(result.status, ExecutionStatus::Ok);
         assert!(artifact_dir.join("work/probe.txt").exists());
+    }
+
+    #[test]
+    #[ignore = "requires mount namespace and chroot privileges in the test environment"]
+    fn keeps_readonly_input_immutable_and_allows_writable_output_dir() {
+        let support = probe_namespace_support();
+        if !support.user_namespace || !support.mount_namespace || !support.pid_namespace {
+            return;
+        }
+        let artifact_dir = unique_artifact_dir("io-policy");
+        let input_dir = artifact_dir.join("inputs");
+        fs::create_dir_all(&input_dir).expect("input dir should exist");
+        let input_file = input_dir.join("input.txt");
+        fs::write(&input_file, "seed").expect("input file should exist");
+
+        let config = ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "{readonly_probe} && {output_probe}"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_user_namespace = true
+                enter_mount_namespace = true
+                enter_pid_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                work_dir = "/work"
+                tmp_dir = "/tmp"
+                readonly_bind_paths = ["{input_file}"]
+                output_dir = "/output"
+                executable_bind_paths = ["/bin", "/usr/bin"]
+            "#,
+            readonly_probe = Scenario::ReadonlyInputProbe.shell_snippet(),
+            output_probe = Scenario::WritableOutputProbe.shell_snippet(),
+            input_file = input_file.display(),
+        ))
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir.clone()),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        assert_eq!(
+            fs::read_to_string(&input_file).expect("input file should remain readable"),
+            "seed"
+        );
+        assert_eq!(
+            fs::read_to_string(artifact_dir.join("outputs/result.txt"))
+                .expect("output file should exist"),
+            "result"
+        );
     }
 
     #[test]

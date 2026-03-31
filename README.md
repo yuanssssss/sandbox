@@ -44,6 +44,7 @@
   - `compat` profile 比 `default` 更宽松，保留 `ptrace`
   - `strict` profile 在 `default` 基础上进一步阻止网络 socket 创建
   - 已补 `sh` / `python3` 在 `default`、`compat`、`strict` 下的兼容性回归，避免误伤常见运行时
+  - 已支持把宿主机输入以 `filesystem.readonly_bind_paths` 只读挂入沙箱，并把 `filesystem.output_dir` 映射到 artifact 下的受控可写目录
 
 ## Workspace 结构
 
