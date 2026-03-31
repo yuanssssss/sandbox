@@ -491,11 +491,19 @@ pub struct JudgeJobTaskResponse {
     pub error: Option<ErrorDetail>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    Execution,
+    JudgeJob,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct JudgeJobTaskEvent {
+pub struct TaskEvent {
     pub sequence: u64,
     pub task_id: String,
     pub request_id: String,
+    pub task_kind: TaskKind,
     pub event_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ExecutionTaskStatus>,
@@ -504,31 +512,11 @@ pub struct JudgeJobTaskEvent {
     pub message: String,
 }
 
-impl JudgeJobTaskEvent {
+impl TaskEvent {
     fn is_terminal(&self) -> bool {
         matches!(
             self.status,
             Some(ExecutionTaskStatus::Completed | ExecutionTaskStatus::Failed)
-        )
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExecutionTaskEvent {
-    pub sequence: u64,
-    pub task_id: String,
-    pub request_id: String,
-    pub status: ExecutionTaskStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stage: Option<String>,
-    pub message: String,
-}
-
-impl ExecutionTaskEvent {
-    fn is_terminal(&self) -> bool {
-        matches!(
-            self.status,
-            ExecutionTaskStatus::Completed | ExecutionTaskStatus::Failed
         )
     }
 }
@@ -1728,16 +1716,16 @@ fn execution_task_event_message(status: ExecutionTaskStatus) -> &'static str {
     }
 }
 
-fn execution_task_sse_event(event: &ExecutionTaskEvent) -> Result<Event, ProtocolError> {
+fn task_sse_event(event: &TaskEvent) -> Result<Event, ProtocolError> {
     Event::default()
-        .event("task_status")
+        .event(&event.event_type)
         .id(event.sequence.to_string())
         .json_data(event)
         .map_err(|err| {
             ProtocolError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal",
-                format!("failed to serialize execution task event: {err}"),
+                format!("failed to serialize task event: {err}"),
                 Some(event.request_id.clone()),
             )
         })
@@ -1750,21 +1738,6 @@ fn judge_job_task_event_message(status: ExecutionTaskStatus) -> &'static str {
         ExecutionTaskStatus::Completed => "judge job task completed",
         ExecutionTaskStatus::Failed => "judge job task failed",
     }
-}
-
-fn judge_job_task_sse_event(event: &JudgeJobTaskEvent) -> Result<Event, ProtocolError> {
-    Event::default()
-        .event(&event.event_type)
-        .id(event.sequence.to_string())
-        .json_data(event)
-        .map_err(|err| {
-            ProtocolError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                format!("failed to serialize judge job task event: {err}"),
-                Some(event.request_id.clone()),
-            )
-        })
 }
 
 struct ExecutionTaskManager<B> {
@@ -1794,8 +1767,8 @@ struct StoredExecutionTask {
     response: ExecutionTaskResponse,
     completed_at: Option<Instant>,
     next_event_sequence: u64,
-    event_history: Vec<ExecutionTaskEvent>,
-    event_sender: broadcast::Sender<ExecutionTaskEvent>,
+    event_history: Vec<TaskEvent>,
+    event_sender: broadcast::Sender<TaskEvent>,
 }
 
 struct JudgeJobTaskManager<B> {
@@ -1811,8 +1784,8 @@ struct StoredJudgeJobTask {
     response: JudgeJobTaskResponse,
     completed_at: Option<Instant>,
     next_event_sequence: u64,
-    event_history: Vec<JudgeJobTaskEvent>,
-    event_sender: broadcast::Sender<JudgeJobTaskEvent>,
+    event_history: Vec<TaskEvent>,
+    event_sender: broadcast::Sender<TaskEvent>,
 }
 
 impl<B> ExecutionTaskManager<B>
@@ -1856,11 +1829,13 @@ where
             status: ExecutionTaskStatus::Accepted,
         };
         let (event_sender, _) = broadcast::channel(16);
-        let accepted_event = ExecutionTaskEvent {
+        let accepted_event = TaskEvent {
             sequence: 0,
             task_id: task_id.clone(),
             request_id: request_id.clone(),
-            status: ExecutionTaskStatus::Accepted,
+            task_kind: TaskKind::Execution,
+            event_type: "task_status".to_string(),
+            status: Some(ExecutionTaskStatus::Accepted),
             stage: Some("execution".to_string()),
             message: "execution task accepted".to_string(),
         };
@@ -1937,13 +1912,7 @@ where
     async fn subscribe(
         &self,
         task_id: &str,
-    ) -> Result<
-        (
-            Vec<ExecutionTaskEvent>,
-            broadcast::Receiver<ExecutionTaskEvent>,
-        ),
-        ProtocolError,
-    > {
+    ) -> Result<(Vec<TaskEvent>, broadcast::Receiver<TaskEvent>), ProtocolError> {
         self.prune_expired_tasks().await;
         let tasks = self.tasks.read().await;
         let task = tasks
@@ -1995,10 +1964,11 @@ where
             status: ExecutionTaskStatus::Accepted,
         };
         let (event_sender, _) = broadcast::channel(32);
-        let accepted_event = JudgeJobTaskEvent {
+        let accepted_event = TaskEvent {
             sequence: 0,
             task_id: task_id.clone(),
             request_id: request_id.clone(),
+            task_kind: TaskKind::JudgeJob,
             event_type: "task_status".to_string(),
             status: Some(ExecutionTaskStatus::Accepted),
             stage: None,
@@ -2087,13 +2057,7 @@ where
     async fn subscribe(
         &self,
         task_id: &str,
-    ) -> Result<
-        (
-            Vec<JudgeJobTaskEvent>,
-            broadcast::Receiver<JudgeJobTaskEvent>,
-        ),
-        ProtocolError,
-    > {
+    ) -> Result<(Vec<TaskEvent>, broadcast::Receiver<TaskEvent>), ProtocolError> {
         self.prune_expired_tasks().await;
         let tasks = self.tasks.read().await;
         let task = tasks
@@ -2180,11 +2144,13 @@ async fn update_task_status(
         task.response.status = status;
         task.response.report = report;
         task.response.error = error;
-        let event = ExecutionTaskEvent {
+        let event = TaskEvent {
             sequence: task.next_event_sequence,
             task_id: task.response.task_id.clone(),
             request_id: task.response.request_id.clone(),
-            status,
+            task_kind: TaskKind::Execution,
+            event_type: "task_status".to_string(),
+            status: Some(status),
             stage: Some("execution".to_string()),
             message: execution_task_event_message(status).to_string(),
         };
@@ -2211,10 +2177,11 @@ async fn update_judge_job_task_status(
         task.response.status = status;
         task.response.report = report;
         task.response.error = error;
-        let event = JudgeJobTaskEvent {
+        let event = TaskEvent {
             sequence: task.next_event_sequence,
             task_id: task.response.task_id.clone(),
             request_id: task.response.request_id.clone(),
+            task_kind: TaskKind::JudgeJob,
             event_type: "task_status".to_string(),
             status: Some(status),
             stage: None,
@@ -2239,10 +2206,11 @@ async fn append_judge_job_audit_events(
     let mut guard = tasks.write().await;
     if let Some(task) = guard.get_mut(task_id) {
         for audit_event in audit_events {
-            let event = JudgeJobTaskEvent {
+            let event = TaskEvent {
                 sequence: task.next_event_sequence,
                 task_id: task.response.task_id.clone(),
                 request_id: task.response.request_id.clone(),
+                task_kind: TaskKind::JudgeJob,
                 event_type: "stage".to_string(),
                 status: None,
                 stage: Some(audit_event.stage.clone()),
@@ -2443,7 +2411,7 @@ where
                     let stream = stream! {
                         for event in history {
                             let terminal = event.is_terminal();
-                            yield judge_job_task_sse_event(&event);
+                            yield task_sse_event(&event);
                             if terminal {
                                 return;
                             }
@@ -2453,7 +2421,7 @@ where
                             match receiver.recv().await {
                                 Ok(event) => {
                                     let terminal = event.is_terminal();
-                                    yield judge_job_task_sse_event(&event);
+                                    yield task_sse_event(&event);
                                     if terminal {
                                         break;
                                     }
@@ -2532,7 +2500,7 @@ where
                     let stream = stream! {
                         for event in history {
                             let terminal = event.is_terminal();
-                            yield execution_task_sse_event(&event);
+                            yield task_sse_event(&event);
                             if terminal {
                                 return;
                             }
@@ -2542,7 +2510,7 @@ where
                             match receiver.recv().await {
                                 Ok(event) => {
                                     let terminal = event.is_terminal();
-                                    yield execution_task_sse_event(&event);
+                                    yield task_sse_event(&event);
                                     if terminal {
                                         break;
                                     }
