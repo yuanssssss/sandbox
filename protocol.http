@@ -215,6 +215,32 @@ Accept: application/json
 }
 
 ###
+# 查看某个 judge job 的 artifact 索引
+# 说明：当前 artifact 索引保存在服务进程内存里，所以要先执行一次同 request_id 的 judge job
+GET {{baseUrl}}/api/v1/judge-jobs/judge-pipeline-001/artifacts
+Accept: application/json
+
+###
+# 读取 compile 阶段 stdout
+GET {{baseUrl}}/api/v1/judge-jobs/judge-pipeline-001/artifacts/compile/file?path=stdout.log
+Accept: text/plain
+
+###
+# 读取 compile 阶段输出目录里的文件
+GET {{baseUrl}}/api/v1/judge-jobs/judge-pipeline-001/artifacts/compile/file?path=outputs/program.txt
+Accept: text/plain
+
+###
+# 读取 run 阶段 stdout
+GET {{baseUrl}}/api/v1/judge-jobs/judge-pipeline-001/artifacts/run/file?path=stdout.log
+Accept: text/plain
+
+###
+# 错误示例：路径逃逸会被拒绝，预期返回 400 invalid_request
+GET {{baseUrl}}/api/v1/judge-jobs/judge-pipeline-001/artifacts/compile/file?path=../secret
+Accept: application/json
+
+###
 # 异步执行：创建任务
 # 如果你的 HTTP client 支持脚本，这里会自动把 task_id 写入 {{taskId}}
 POST {{baseUrl}}/api/v1/executions/async

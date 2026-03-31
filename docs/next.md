@@ -18,8 +18,10 @@
   `compilation_failed` 与沙箱失败，并返回编译产物路径
 - [x] 已完成第 3 项：judge job 已支持 `compile -> run -> checker` 阶段编排，
   任一阶段失败都会短路后续阶段，并返回逐阶段报告
-- [ ] 当前下一步：增加 artifact 索引和下载接口
-- [ ] 后续再继续接异步流式状态与任务清理
+- [x] 已完成第 4 项：protocol 已支持 judge job artifact 索引和文件读取接口，可通过
+  HTTP 读取各阶段 `stdout`、`stderr` 和 `outputs/` 下的文件
+- [ ] 当前下一步：补 Unix domain socket 与 checker 混跑攻击样例
+- [ ] 后续再继续接编译阶段隔离样例、任务清理和异步流式状态
 
 ## 推荐顺序
 

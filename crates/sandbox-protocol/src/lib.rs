@@ -7,9 +7,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use axum::extract::Path as AxumPath;
 use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path as AxumPath, Query};
 use axum::http::StatusCode;
+use axum::http::header::{CONTENT_TYPE, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -251,6 +252,29 @@ pub struct JudgeJobReport {
     pub audit_events: Vec<AuditEvent>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeJobArtifactIndexResponse {
+    pub request_id: String,
+    pub stages: Vec<JudgeStageArtifactIndex>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeStageArtifactIndex {
+    pub stage: JudgeStageName,
+    pub status: JudgeStageStatus,
+    #[serde(default)]
+    pub artifact_dir: Option<PathBuf>,
+    pub artifacts: Vec<JudgeArtifactEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgeArtifactEntry {
+    pub path: PathBuf,
+    pub kind: JudgeArtifactKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
 impl JudgeJobRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.request_id.trim().is_empty() {
@@ -453,6 +477,11 @@ pub struct ErrorResponse {
     pub error: ErrorDetail,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ArtifactFileQuery {
+    path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorDetail {
     pub code: String,
@@ -642,6 +671,53 @@ fn task_not_found_error(task_id: &str) -> ProtocolError {
         "not_found",
         format!("execution task `{task_id}` was not found"),
         None,
+    )
+}
+
+fn judge_job_not_found_error(request_id: &str) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        format!("judge job `{request_id}` was not found"),
+        None,
+    )
+}
+
+fn artifact_stage_not_found_error(request_id: &str, stage: &str) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        format!("judge job `{request_id}` does not contain stage `{stage}`"),
+        None,
+    )
+}
+
+fn missing_artifact_dir_error(request_id: &str, stage: JudgeStageName) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::CONFLICT,
+        "missing_artifact",
+        format!(
+            "judge job `{request_id}` stage `{}` has no materialized artifact directory",
+            stage.as_str()
+        ),
+        Some(request_id.to_string()),
+    )
+}
+
+fn unsupported_artifact_path_error(
+    request_id: &str,
+    stage: JudgeStageName,
+    path: &Path,
+) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        format!(
+            "judge job `{request_id}` stage `{}` does not expose artifact `{}`",
+            stage.as_str(),
+            path.display()
+        ),
+        Some(request_id.to_string()),
     )
 }
 
@@ -938,6 +1014,196 @@ fn build_compilation_stage_artifacts(result: &CompilationResult) -> Vec<JudgeSta
     }
 
     artifacts
+}
+
+fn stage_report_by_name(
+    report: &JudgeJobReport,
+    stage: JudgeStageName,
+) -> Option<&JudgeStageReport> {
+    match stage {
+        JudgeStageName::Compile => report.compile.as_ref(),
+        JudgeStageName::Run => Some(&report.run),
+        JudgeStageName::Checker => report.checker.as_ref(),
+    }
+}
+
+fn parse_stage_name(raw: &str) -> Result<JudgeStageName, ProtocolError> {
+    match raw {
+        "compile" => Ok(JudgeStageName::Compile),
+        "run" => Ok(JudgeStageName::Run),
+        "checker" => Ok(JudgeStageName::Checker),
+        _ => Err(ProtocolError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("unknown judge stage `{raw}`"),
+            None,
+        )),
+    }
+}
+
+fn relative_path_within_root(root: &Path, path: &Path) -> Option<PathBuf> {
+    path.strip_prefix(root).ok().map(PathBuf::from)
+}
+
+fn discover_output_directory_entries(
+    artifact_root: &Path,
+    directory: &Path,
+    entries: &mut HashMap<PathBuf, JudgeArtifactEntry>,
+) -> Result<(), ProtocolError> {
+    if !directory.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(directory).map_err(|err| {
+        ProtocolError::from(SandboxError::io("reading artifact output directory", err))
+    })? {
+        let entry = entry.map_err(|err| {
+            ProtocolError::from(SandboxError::io("reading artifact output entry", err))
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|err| {
+            ProtocolError::from(SandboxError::io("reading artifact output entry type", err))
+        })?;
+        let Some(relative_path) = relative_path_within_root(artifact_root, &path) else {
+            continue;
+        };
+
+        let metadata = entry.metadata().map_err(|err| {
+            ProtocolError::from(SandboxError::io("reading artifact metadata", err))
+        })?;
+        let kind = if file_type.is_dir() {
+            JudgeArtifactKind::Directory
+        } else {
+            JudgeArtifactKind::File
+        };
+        entries
+            .entry(relative_path.clone())
+            .or_insert(JudgeArtifactEntry {
+                path: relative_path.clone(),
+                kind,
+                size_bytes: file_type.is_file().then_some(metadata.len()),
+            });
+
+        if file_type.is_dir() {
+            discover_output_directory_entries(artifact_root, &path, entries)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_stage_artifact_entries(
+    stage_report: &JudgeStageReport,
+) -> Result<Vec<JudgeArtifactEntry>, ProtocolError> {
+    let Some(artifact_root) = stage_report.artifact_dir.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    let mut entries = HashMap::new();
+    for artifact in &stage_report.artifacts {
+        let Some(relative_path) = relative_path_within_root(artifact_root, &artifact.path) else {
+            continue;
+        };
+        let size_bytes = fs::metadata(&artifact.path)
+            .ok()
+            .and_then(|metadata| metadata.is_file().then_some(metadata.len()));
+        entries
+            .entry(relative_path.clone())
+            .or_insert(JudgeArtifactEntry {
+                path: relative_path.clone(),
+                kind: artifact.kind,
+                size_bytes,
+            });
+
+        if artifact.kind == JudgeArtifactKind::OutputDirectory {
+            discover_output_directory_entries(artifact_root, &artifact.path, &mut entries)?;
+        }
+    }
+
+    let mut values = entries.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(values)
+}
+
+fn build_judge_job_artifact_index(
+    report: &JudgeJobReport,
+) -> Result<JudgeJobArtifactIndexResponse, ProtocolError> {
+    let mut stages = Vec::new();
+    for stage in [
+        JudgeStageName::Compile,
+        JudgeStageName::Run,
+        JudgeStageName::Checker,
+    ] {
+        if let Some(stage_report) = stage_report_by_name(report, stage) {
+            stages.push(JudgeStageArtifactIndex {
+                stage,
+                status: stage_report.status,
+                artifact_dir: stage_report.artifact_dir.clone(),
+                artifacts: build_stage_artifact_entries(stage_report)?,
+            });
+        }
+    }
+
+    Ok(JudgeJobArtifactIndexResponse {
+        request_id: report.request.request_id.clone(),
+        stages,
+    })
+}
+
+fn resolve_downloadable_stage_file(
+    report: &JudgeJobReport,
+    stage: JudgeStageName,
+    requested_path: &Path,
+) -> Result<PathBuf, ProtocolError> {
+    validate_relative_artifact_path(&report.request.request_id, stage, requested_path)?;
+
+    let stage_report = stage_report_by_name(report, stage).ok_or_else(|| {
+        artifact_stage_not_found_error(&report.request.request_id, stage.as_str())
+    })?;
+    let artifact_root = stage_report
+        .artifact_dir
+        .as_ref()
+        .ok_or_else(|| missing_artifact_dir_error(&report.request.request_id, stage))?;
+    let entries = build_stage_artifact_entries(stage_report)?;
+    let allowed = entries.iter().any(|entry| entry.path == requested_path);
+    if !allowed {
+        return Err(unsupported_artifact_path_error(
+            &report.request.request_id,
+            stage,
+            requested_path,
+        ));
+    }
+
+    let full_path = artifact_root.join(requested_path);
+    if !full_path.starts_with(artifact_root) {
+        return Err(unsupported_artifact_path_error(
+            &report.request.request_id,
+            stage,
+            requested_path,
+        ));
+    }
+    if !full_path.exists() {
+        return Err(ProtocolError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!(
+                "artifact `{}` for judge job `{}` stage `{}` no longer exists on disk",
+                requested_path.display(),
+                report.request.request_id,
+                stage.as_str()
+            ),
+            Some(report.request.request_id.clone()),
+        ));
+    }
+
+    Ok(full_path)
+}
+
+fn content_type_for_artifact(path: &Path) -> &'static str {
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("log") | Some("txt") | Some("out") | Some("err") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 fn failed_stage_report(
@@ -1340,6 +1606,30 @@ where
     }
 }
 
+#[derive(Debug, Default)]
+struct JudgeJobStore {
+    jobs: Arc<RwLock<HashMap<String, JudgeJobReport>>>,
+}
+
+impl JudgeJobStore {
+    fn new() -> Self {
+        Self {
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn insert(&self, report: JudgeJobReport) {
+        self.jobs
+            .write()
+            .await
+            .insert(report.request.request_id.clone(), report);
+    }
+
+    async fn get(&self, request_id: &str) -> Option<JudgeJobReport> {
+        self.jobs.read().await.get(request_id).cloned()
+    }
+}
+
 async fn update_task_status(
     tasks: &RwLock<HashMap<String, ExecutionTaskResponse>>,
     task_id: &str,
@@ -1365,6 +1655,10 @@ where
     let validate_backend = Arc::clone(&backend);
     let execute_backend = Arc::clone(&backend);
     let judge_job_backend = Arc::clone(&backend);
+    let judge_job_store = Arc::new(JudgeJobStore::new());
+    let judge_job_submit_store = Arc::clone(&judge_job_store);
+    let judge_job_index_store = Arc::clone(&judge_job_store);
+    let judge_job_file_store = Arc::clone(&judge_job_store);
     let async_submit_manager = Arc::new(ExecutionTaskManager::new(Arc::clone(&backend)));
     let async_status_manager = Arc::clone(&async_submit_manager);
 
@@ -1412,9 +1706,49 @@ where
             post(
                 move |payload: Result<Json<JudgeJobRequest>, JsonRejection>| {
                     let backend = Arc::clone(&judge_job_backend);
+                    let store = Arc::clone(&judge_job_submit_store);
                     async move {
                         let Json(request) = payload.map_err(json_rejection_to_protocol_error)?;
-                        backend.execute_judge_job(request).await.map(Json)
+                        let report = backend.execute_judge_job(request).await?;
+                        store.insert(report.clone()).await;
+                        Ok::<Json<JudgeJobReport>, ProtocolError>(Json(report))
+                    }
+                },
+            ),
+        )
+        .route(
+            "/api/v1/judge-jobs/{request_id}/artifacts",
+            get(move |AxumPath(request_id): AxumPath<String>| {
+                let store = Arc::clone(&judge_job_index_store);
+                async move {
+                    let report = store
+                        .get(&request_id)
+                        .await
+                        .ok_or_else(|| judge_job_not_found_error(&request_id))?;
+                    build_judge_job_artifact_index(&report).map(Json)
+                }
+            }),
+        )
+        .route(
+            "/api/v1/judge-jobs/{request_id}/artifacts/{stage}/file",
+            get(
+                move |AxumPath((request_id, stage)): AxumPath<(String, String)>,
+                      Query(query): Query<ArtifactFileQuery>| {
+                    let store = Arc::clone(&judge_job_file_store);
+                    async move {
+                        let stage = parse_stage_name(&stage)?;
+                        let report = store
+                            .get(&request_id)
+                            .await
+                            .ok_or_else(|| judge_job_not_found_error(&request_id))?;
+                        let full_path =
+                            resolve_downloadable_stage_file(&report, stage, &query.path)?;
+                        let body = fs::read(&full_path).map_err(|err| {
+                            ProtocolError::from(SandboxError::io("reading artifact file", err))
+                        })?;
+                        let content_type =
+                            HeaderValue::from_static(content_type_for_artifact(&full_path));
+                        Ok::<_, ProtocolError>(([(CONTENT_TYPE, content_type)], body))
                     }
                 },
             ),
@@ -1670,6 +2004,7 @@ mod tests {
     use serde::de::DeserializeOwned;
     use std::fs;
     use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
     use tower::util::ServiceExt;
 
@@ -1874,9 +2209,10 @@ enable_rootfs = false
     }
 
     fn sample_judge_job_request() -> JudgeJobRequest {
+        let artifact_dir = unique_test_artifact_dir("judge-run");
         JudgeJobRequest {
             request_id: "judge-run-001".to_string(),
-            artifact_dir: Some("/tmp/sandbox-api/judge-run-001".into()),
+            artifact_dir: Some(artifact_dir),
             compile: None,
             run: JudgeStageRequest {
                 config: sample_config(),
@@ -1889,9 +2225,10 @@ enable_rootfs = false
     }
 
     fn sample_multi_stage_judge_job_request() -> JudgeJobRequest {
+        let artifact_dir = unique_test_artifact_dir("judge-pipeline");
         JudgeJobRequest {
             request_id: "judge-pipeline-001".to_string(),
-            artifact_dir: Some("/tmp/sandbox-api/judge-pipeline-001".into()),
+            artifact_dir: Some(artifact_dir),
             compile: Some(JudgeStageRequest {
                 config: sample_config(),
                 command_override: Some(vec![
@@ -1927,6 +2264,14 @@ enable_rootfs = false
                 },
             }),
         }
+    }
+
+    fn unique_test_artifact_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("sandbox-protocol-{prefix}-{stamp}"))
     }
 
     async fn response_json<T: DeserializeOwned>(response: Response) -> T {
@@ -2071,7 +2416,9 @@ enable_rootfs = false
     #[tokio::test]
     async fn judge_job_run_only_returns_report() {
         let app = build_router(TestBackend);
-        let payload = serde_json::to_vec(&sample_judge_job_request()).unwrap();
+        let request = sample_judge_job_request();
+        let expected_artifact_dir = request.artifact_dir.clone().unwrap().join("run");
+        let payload = serde_json::to_vec(&request).unwrap();
         let response = send(
             &app,
             Request::builder()
@@ -2091,10 +2438,7 @@ enable_rootfs = false
         assert!(body.checker.is_none());
         assert_eq!(body.run.stage, JudgeStageName::Run);
         assert_eq!(body.run.status, JudgeStageStatus::Completed);
-        assert_eq!(
-            body.run.artifact_dir,
-            Some(PathBuf::from("/tmp/sandbox-api/judge-run-001/run"))
-        );
+        assert_eq!(body.run.artifact_dir, Some(expected_artifact_dir));
         assert_eq!(
             body.run
                 .result
@@ -2112,6 +2456,7 @@ enable_rootfs = false
     async fn judge_job_multi_stage_pipeline_returns_per_stage_reports() {
         let app = build_router(TestBackend);
         let request = sample_multi_stage_judge_job_request();
+        let artifact_root = request.artifact_dir.clone().unwrap();
         let payload = serde_json::to_vec(&request).unwrap();
         let response = send(
             &app,
@@ -2150,18 +2495,15 @@ enable_rootfs = false
                 .as_ref()
                 .map(|report| report.artifact_dir.clone())
                 .flatten(),
-            Some(PathBuf::from("/tmp/sandbox-api/judge-pipeline-001/compile"))
+            Some(artifact_root.join("compile"))
         );
-        assert_eq!(
-            body.run.artifact_dir,
-            Some(PathBuf::from("/tmp/sandbox-api/judge-pipeline-001/run"))
-        );
+        assert_eq!(body.run.artifact_dir, Some(artifact_root.join("run")));
         assert_eq!(
             body.checker
                 .as_ref()
                 .map(|report| report.artifact_dir.clone())
                 .flatten(),
-            Some(PathBuf::from("/tmp/sandbox-api/judge-pipeline-001/checker"))
+            Some(artifact_root.join("checker"))
         );
         assert!(
             body.audit_events
@@ -2173,6 +2515,154 @@ enable_rootfs = false
                 .iter()
                 .any(|event| event.stage == "checker_completed")
         );
+    }
+
+    #[tokio::test]
+    async fn judge_job_artifact_index_lists_stage_files() {
+        let app = build_router(TestBackend);
+        let request = sample_multi_stage_judge_job_request();
+        let payload = serde_json::to_vec(&request).unwrap();
+        let submit_response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/judge-jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(submit_response.status(), StatusCode::OK);
+
+        let response = send(
+            &app,
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/judge-jobs/{}/artifacts",
+                    request.request_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: JudgeJobArtifactIndexResponse = response_json(response).await;
+        assert_eq!(body.request_id, request.request_id);
+        assert_eq!(body.stages.len(), 3);
+        let compile_stage = body
+            .stages
+            .iter()
+            .find(|stage| stage.stage == JudgeStageName::Compile)
+            .unwrap();
+        assert!(
+            compile_stage
+                .artifacts
+                .iter()
+                .any(|entry| entry.path == PathBuf::from("stdout.log"))
+        );
+        assert!(
+            compile_stage
+                .artifacts
+                .iter()
+                .any(|entry| entry.path == PathBuf::from("outputs/program.txt"))
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_job_artifact_download_reads_stdout_and_output_files() {
+        let app = build_router(TestBackend);
+        let request = sample_multi_stage_judge_job_request();
+        let payload = serde_json::to_vec(&request).unwrap();
+        let submit_response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/judge-jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(submit_response.status(), StatusCode::OK);
+
+        let stdout_response = send(
+            &app,
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/judge-jobs/{}/artifacts/run/file?path=stdout.log",
+                    request.request_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(stdout_response.status(), StatusCode::OK);
+        let stdout_bytes = to_bytes(stdout_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(stdout_bytes.to_vec()).unwrap(),
+            "compiled output\n"
+        );
+
+        let output_response = send(
+            &app,
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/judge-jobs/{}/artifacts/compile/file?path=outputs/program.txt",
+                    request.request_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(output_response.status(), StatusCode::OK);
+        let output_bytes = to_bytes(output_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output_bytes.to_vec()).unwrap(),
+            "compiled output\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_job_artifact_download_rejects_path_escape() {
+        let app = build_router(TestBackend);
+        let request = sample_multi_stage_judge_job_request();
+        let payload = serde_json::to_vec(&request).unwrap();
+        let submit_response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/judge-jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(submit_response.status(), StatusCode::OK);
+
+        let response = send(
+            &app,
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/judge-jobs/{}/artifacts/compile/file?path=../secret",
+                    request.request_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: ErrorResponse = response_json(response).await;
+        assert_eq!(body.error.code, "invalid_request");
     }
 
     #[derive(Clone)]

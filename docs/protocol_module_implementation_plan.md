@@ -130,6 +130,8 @@
 - 当前后端已经支持 `compile -> run -> checker` 顺序执行
 - 任一阶段失败都会停止后续阶段，并把未执行阶段标成 `skipped`
 - `stdin` artifact 引用会直接接到后续阶段输入，`readonly_artifacts` 会被物化到受控输入目录后再挂载
+- 已支持通过 HTTP 查询 judge job artifact 索引并读取单个文件
+- 当前 artifact 注册表仍是进程内内存缓存，重启服务后需要重新执行任务才能再次下载
 
 请求体建议：
 
@@ -200,6 +202,48 @@
 }
 ```
 
+### `GET /api/v1/judge-jobs/{request_id}/artifacts`
+
+用途：
+返回该 judge job 各阶段当前可见的 artifact 索引，至少覆盖 `stdout`、`stderr`
+以及 `outputs/` 目录下的文件。
+
+响应建议：
+
+```json
+{
+  "request_id": "judge-pipeline-001",
+  "stages": [
+    {
+      "stage": "compile",
+      "status": "completed",
+      "artifact_dir": "/tmp/sandbox-api/judge-pipeline-001/compile",
+      "artifacts": [
+        { "path": "stdout.log", "kind": "stdout", "size_bytes": 32 },
+        { "path": "stderr.log", "kind": "stderr", "size_bytes": 0 },
+        { "path": "outputs/program.txt", "kind": "file", "size_bytes": 15 }
+      ]
+    }
+  ]
+}
+```
+
+### `GET /api/v1/judge-jobs/{request_id}/artifacts/{stage}/file?path=...`
+
+用途：
+读取某个阶段 artifact 根目录下的单个文件内容，例如：
+
+- `stdout.log`
+- `stderr.log`
+- `outputs/program.txt`
+
+约束：
+
+- `path` 必须是相对路径
+- 不允许 `..`、绝对路径或根路径逃逸
+- 当前只暴露阶段显式产物和 `outputs/` 目录中的文件，不暴露内部 `rootfs/`、`work/`、
+  `stage-inputs/` 等实现细节目录
+
 ## 5. 错误映射
 
 协议层需要把 `SandboxError` 映射成稳定的 HTTP 语义：
@@ -246,10 +290,10 @@
 
 ## 8. 下一阶段扩展
 
-MVP、多阶段协议模型和基础阶段编排完成后，建议按下面顺序继续扩展：
+MVP、多阶段协议模型、基础阶段编排和 artifact 读取接口完成后，建议按下面顺序继续扩展：
 
-1. 增加阶段 artifact 索引与下载接口，例如 stdout/stderr/outputs 读取。
-2. 增加异步任务模型到 `judge-jobs`，返回 `202 Accepted` 与任务 ID。
+1. 增加异步任务模型到 `judge-jobs`，返回 `202 Accepted` 与任务 ID。
+2. 给内存中的 artifact 注册表补 TTL、容量上限和清理策略。
 3. 增加审计日志流式输出或 SSE。
 4. 增加鉴权、中间件、请求大小限制和并发限制。
 

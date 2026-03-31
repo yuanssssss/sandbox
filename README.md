@@ -181,6 +181,9 @@ make docker-shell-prod
 - `POST /api/v1/executions`
 - `POST /api/v1/executions/async`
 - `GET /api/v1/executions/{task_id}`
+- `POST /api/v1/judge-jobs`
+- `GET /api/v1/judge-jobs/{request_id}/artifacts`
+- `GET /api/v1/judge-jobs/{request_id}/artifacts/{stage}/file?path=...`
 
 同步执行示例：
 
@@ -229,6 +232,21 @@ curl -sS http://127.0.0.1:3000/api/v1/executions/async \
 ```bash
 curl -sS http://127.0.0.1:3000/api/v1/executions/exec-1
 ```
+
+judge job artifact 索引示例：
+
+```bash
+curl -sS http://127.0.0.1:3000/api/v1/judge-jobs/judge-pipeline-001/artifacts
+```
+
+judge job artifact 下载示例：
+
+```bash
+curl -sS "http://127.0.0.1:3000/api/v1/judge-jobs/judge-pipeline-001/artifacts/compile/file?path=outputs/program.txt"
+```
+
+当前 artifact 索引保存在协议服务进程内存里，所以要先由同一个服务进程执行过对应的
+`request_id`，之后才能通过这些路由读取结果文件。
 
 错误响应统一为：
 
