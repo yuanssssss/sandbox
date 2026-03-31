@@ -136,14 +136,11 @@ Accept: application/json
   }
 }
 
-> {%
-client.global.set("taskId", response.body.task_id);
-%}
 
 ###
 # 查询异步任务状态
 # 可能看到 accepted / running / completed / failed
-GET {{baseUrl}}/api/v1/executions/{{taskId}}
+GET {{baseUrl}}/api/v1/executions/exec-1
 Accept: application/json
 
 ###
