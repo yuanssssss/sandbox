@@ -434,6 +434,24 @@ pub struct ExecutionTaskResponse {
     pub error: Option<ErrorDetail>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeJobTaskAccepted {
+    pub task_id: String,
+    pub request_id: String,
+    pub status: ExecutionTaskStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeJobTaskResponse {
+    pub task_id: String,
+    pub request_id: String,
+    pub status: ExecutionTaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<JudgeJobReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorDetail>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionTaskEvent {
     pub sequence: u64,
@@ -701,6 +719,15 @@ fn task_not_found_error(task_id: &str) -> ProtocolError {
         StatusCode::NOT_FOUND,
         "not_found",
         format!("execution task `{task_id}` was not found"),
+        None,
+    )
+}
+
+fn judge_job_task_not_found_error(task_id: &str) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        format!("judge job task `{task_id}` was not found"),
         None,
     )
 }
@@ -1613,6 +1640,20 @@ struct StoredExecutionTask {
     event_sender: broadcast::Sender<ExecutionTaskEvent>,
 }
 
+struct JudgeJobTaskManager<B> {
+    backend: Arc<B>,
+    next_task_id: AtomicU64,
+    retention: AsyncTaskRetentionPolicy,
+    store: Arc<JudgeJobStore>,
+    tasks: Arc<RwLock<HashMap<String, StoredJudgeJobTask>>>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredJudgeJobTask {
+    response: JudgeJobTaskResponse,
+    completed_at: Option<Instant>,
+}
+
 impl<B> ExecutionTaskManager<B>
 where
     B: ProtocolBackend,
@@ -1755,6 +1796,112 @@ where
     }
 }
 
+impl<B> JudgeJobTaskManager<B>
+where
+    B: ProtocolBackend,
+{
+    fn new(backend: Arc<B>, store: Arc<JudgeJobStore>) -> Self {
+        Self::with_policy(backend, store, AsyncTaskRetentionPolicy::default())
+    }
+
+    fn with_policy(
+        backend: Arc<B>,
+        store: Arc<JudgeJobStore>,
+        retention: AsyncTaskRetentionPolicy,
+    ) -> Self {
+        Self {
+            backend,
+            next_task_id: AtomicU64::new(1),
+            retention,
+            store,
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn submit(&self, request: JudgeJobRequest) -> Result<JudgeJobTaskAccepted, ProtocolError> {
+        request.validate()?;
+        let request_id = request.request_id.clone();
+        let task_id = format!("judge-{}", self.next_task_id.fetch_add(1, Ordering::Relaxed));
+        let accepted = JudgeJobTaskAccepted {
+            task_id: task_id.clone(),
+            request_id: request_id.clone(),
+            status: ExecutionTaskStatus::Accepted,
+        };
+
+        let mut tasks = self.tasks.write().await;
+        prune_expired_judge_job_tasks_locked(&mut tasks, self.retention, Instant::now());
+        if tasks.len() >= self.retention.max_tasks {
+            return Err(async_task_capacity_exceeded_error(
+                self.retention.max_tasks,
+                &request_id,
+            ));
+        }
+        tasks.insert(
+            task_id.clone(),
+            StoredJudgeJobTask {
+                response: JudgeJobTaskResponse {
+                    task_id: task_id.clone(),
+                    request_id: request_id.clone(),
+                    status: ExecutionTaskStatus::Accepted,
+                    report: None,
+                    error: None,
+                },
+                completed_at: None,
+            },
+        );
+        drop(tasks);
+
+        let backend = Arc::clone(&self.backend);
+        let store = Arc::clone(&self.store);
+        let tasks = Arc::clone(&self.tasks);
+        let retention = self.retention;
+        tokio::spawn(async move {
+            update_judge_job_task_status(&tasks, &task_id, ExecutionTaskStatus::Running, None, None)
+                .await;
+            match backend.execute_judge_job(request).await {
+                Ok(report) => {
+                    store.insert(report.clone()).await;
+                    update_judge_job_task_status(
+                        &tasks,
+                        &task_id,
+                        ExecutionTaskStatus::Completed,
+                        Some(report),
+                        None,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let detail = error_detail_from_protocol_error(error, Some(request_id));
+                    update_judge_job_task_status(
+                        &tasks,
+                        &task_id,
+                        ExecutionTaskStatus::Failed,
+                        None,
+                        Some(detail),
+                    )
+                    .await;
+                }
+            }
+            prune_expired_judge_job_tasks_with_policy(&tasks, retention).await;
+        });
+
+        Ok(accepted)
+    }
+
+    async fn get(&self, task_id: &str) -> Option<JudgeJobTaskResponse> {
+        self.prune_expired_tasks().await;
+        self.tasks
+            .read()
+            .await
+            .get(task_id)
+            .map(|task| task.response.clone())
+    }
+
+    async fn prune_expired_tasks(&self) {
+        prune_expired_judge_job_tasks_with_policy(&self.tasks, self.retention).await;
+    }
+}
+
 #[derive(Debug, Default)]
 struct JudgeJobStore {
     jobs: Arc<RwLock<HashMap<String, JudgeJobReport>>>,
@@ -1810,6 +1957,26 @@ async fn update_task_status(
     }
 }
 
+async fn update_judge_job_task_status(
+    tasks: &RwLock<HashMap<String, StoredJudgeJobTask>>,
+    task_id: &str,
+    status: ExecutionTaskStatus,
+    report: Option<JudgeJobReport>,
+    error: Option<ErrorDetail>,
+) {
+    let mut guard = tasks.write().await;
+    if let Some(task) = guard.get_mut(task_id) {
+        task.response.status = status;
+        task.response.report = report;
+        task.response.error = error;
+        task.completed_at = matches!(
+            status,
+            ExecutionTaskStatus::Completed | ExecutionTaskStatus::Failed
+        )
+        .then_some(Instant::now());
+    }
+}
+
 async fn prune_expired_tasks_with_policy(
     tasks: &RwLock<HashMap<String, StoredExecutionTask>>,
     retention: AsyncTaskRetentionPolicy,
@@ -1821,6 +1988,27 @@ async fn prune_expired_tasks_with_policy(
 
 fn prune_expired_tasks_locked(
     tasks: &mut HashMap<String, StoredExecutionTask>,
+    retention: AsyncTaskRetentionPolicy,
+    now: Instant,
+) {
+    tasks.retain(|_, task| {
+        task.completed_at
+            .map(|completed_at| now.duration_since(completed_at) < retention.completed_ttl)
+            .unwrap_or(true)
+    });
+}
+
+async fn prune_expired_judge_job_tasks_with_policy(
+    tasks: &RwLock<HashMap<String, StoredJudgeJobTask>>,
+    retention: AsyncTaskRetentionPolicy,
+) {
+    let now = Instant::now();
+    let mut guard = tasks.write().await;
+    prune_expired_judge_job_tasks_locked(&mut guard, retention, now);
+}
+
+fn prune_expired_judge_job_tasks_locked(
+    tasks: &mut HashMap<String, StoredJudgeJobTask>,
     retention: AsyncTaskRetentionPolicy,
     now: Instant,
 ) {
@@ -1845,6 +2033,12 @@ where
     let judge_job_submit_store = Arc::clone(&judge_job_store);
     let judge_job_index_store = Arc::clone(&judge_job_store);
     let judge_job_file_store = Arc::clone(&judge_job_store);
+    let async_judge_job_manager = Arc::new(JudgeJobTaskManager::new(
+        Arc::clone(&backend),
+        Arc::clone(&judge_job_store),
+    ));
+    let async_judge_job_submit_manager = Arc::clone(&async_judge_job_manager);
+    let async_judge_job_status_manager = Arc::clone(&async_judge_job_manager);
     let async_submit_manager = Arc::new(ExecutionTaskManager::new(Arc::clone(&backend)));
     let async_status_manager = Arc::clone(&async_submit_manager);
     let async_events_manager = Arc::clone(&async_submit_manager);
@@ -1902,6 +2096,34 @@ where
                     }
                 },
             ),
+        )
+        .route(
+            "/api/v1/judge-jobs/async",
+            post(
+                move |payload: Result<Json<JudgeJobRequest>, JsonRejection>| {
+                    let manager = Arc::clone(&async_judge_job_submit_manager);
+                    async move {
+                        let Json(request) = payload.map_err(json_rejection_to_protocol_error)?;
+                        manager
+                            .submit(request)
+                            .await
+                            .map(|accepted| (StatusCode::ACCEPTED, Json(accepted)))
+                    }
+                },
+            ),
+        )
+        .route(
+            "/api/v1/judge-jobs/tasks/{task_id}",
+            get(move |AxumPath(task_id): AxumPath<String>| {
+                let manager = Arc::clone(&async_judge_job_status_manager);
+                async move {
+                    manager
+                        .get(&task_id)
+                        .await
+                        .ok_or_else(|| judge_job_task_not_found_error(&task_id))
+                        .map(Json)
+                }
+            }),
         )
         .route(
             "/api/v1/judge-jobs/{request_id}/artifacts",
@@ -3267,6 +3489,93 @@ enable_rootfs = false
                 })
             })
         }
+
+        fn execute_judge_job(
+            &self,
+            request: JudgeJobRequest,
+        ) -> BackendFuture<Result<JudgeJobReport, ProtocolError>> {
+            let gate = Arc::clone(&self.gate);
+            let started = Arc::clone(&self.started);
+            let fail = self.fail;
+            Box::pin(async move {
+                started.notify_one();
+                gate.notified().await;
+                if fail {
+                    return Err(ProtocolError::new(
+                        StatusCode::CONFLICT,
+                        "capability_unavailable",
+                        "network namespace unavailable",
+                        Some(request.request_id),
+                    ));
+                }
+
+                let artifact_dir = request.resolved_stage_artifact_dir(JudgeStageName::Run);
+                let command = request
+                    .run
+                    .command_override
+                    .clone()
+                    .unwrap_or_else(|| request.run.config.process.argv.clone());
+                Ok(JudgeJobReport {
+                    request: request.clone(),
+                    status: JudgeJobStatus::Completed,
+                    compile: None,
+                    run: JudgeStageReport {
+                        stage: JudgeStageName::Run,
+                        request: request.run.clone(),
+                        status: JudgeStageStatus::Completed,
+                        artifact_dir: Some(artifact_dir.clone()),
+                        result: Some(ExecutionResult {
+                            command,
+                            exit_code: Some(0),
+                            term_signal: None,
+                            usage: ResourceUsage {
+                                cpu_time_ms: Some(1),
+                                wall_time_ms: 2,
+                                memory_peak_bytes: Some(3),
+                            },
+                            stdout_path: artifact_dir.join("stdout.log"),
+                            stderr_path: artifact_dir.join("stderr.log"),
+                            status: ExecutionStatus::Ok,
+                        }),
+                        compilation_result: None,
+                        artifacts: vec![
+                            JudgeStageArtifact {
+                                name: "stdout".to_string(),
+                                kind: JudgeArtifactKind::Stdout,
+                                path: artifact_dir.join("stdout.log"),
+                            },
+                            JudgeStageArtifact {
+                                name: "stderr".to_string(),
+                                kind: JudgeArtifactKind::Stderr,
+                                path: artifact_dir.join("stderr.log"),
+                            },
+                        ],
+                        audit_events: vec![
+                            AuditEvent {
+                                stage: "accepted".to_string(),
+                                message: "execution request accepted".to_string(),
+                            },
+                            AuditEvent {
+                                stage: "completed".to_string(),
+                                message: "execution finished".to_string(),
+                            },
+                        ],
+                        error: None,
+                    },
+                    checker: None,
+                    audit_events: vec![
+                        AuditEvent {
+                            stage: "accepted".to_string(),
+                            message: "judge job accepted".to_string(),
+                        },
+                        AuditEvent {
+                            stage: "completed".to_string(),
+                            message: "judge job finished with status `completed`".to_string(),
+                        },
+                    ],
+                })
+            })
+        }
     }
 
     async fn fetch_task_response(app: &Router, task_id: &str) -> Response {
@@ -3287,6 +3596,18 @@ enable_rootfs = false
             Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/executions/{task_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn fetch_judge_job_task_response(app: &Router, task_id: &str) -> Response {
+        send(
+            app,
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/judge-jobs/tasks/{task_id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3404,6 +3725,108 @@ enable_rootfs = false
         }
 
         panic!("async execution task did not fail in time");
+    }
+
+    #[tokio::test]
+    async fn async_judge_job_returns_accepted_and_completed_status() {
+        let backend = GatedBackend::success();
+        let app = build_router(backend.clone());
+        let payload = serde_json::to_vec(&sample_judge_job_request()).unwrap();
+
+        let response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/judge-jobs/async")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let accepted: JudgeJobTaskAccepted = response_json(response).await;
+        assert_eq!(accepted.request_id, "judge-run-001");
+        assert_eq!(accepted.status, ExecutionTaskStatus::Accepted);
+        assert!(accepted.task_id.starts_with("judge-"));
+
+        backend.started.notified().await;
+
+        let running_response = fetch_judge_job_task_response(&app, &accepted.task_id).await;
+        assert_eq!(running_response.status(), StatusCode::OK);
+        let running: JudgeJobTaskResponse = response_json(running_response).await;
+        assert_eq!(running.status, ExecutionTaskStatus::Running);
+        assert!(running.report.is_none());
+        assert!(running.error.is_none());
+
+        backend.gate.notify_waiters();
+
+        for _ in 0..20 {
+            let completed_response = fetch_judge_job_task_response(&app, &accepted.task_id).await;
+            let completed: JudgeJobTaskResponse = response_json(completed_response).await;
+            if completed.status == ExecutionTaskStatus::Completed {
+                assert_eq!(completed.request_id, "judge-run-001");
+                assert!(completed.error.is_none());
+                assert_eq!(
+                    completed.report.as_ref().map(|report| report.status),
+                    Some(JudgeJobStatus::Completed)
+                );
+
+                let artifacts_response = send(
+                    &app,
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/judge-jobs/judge-run-001/artifacts")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+                assert_eq!(artifacts_response.status(), StatusCode::OK);
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        panic!("async judge job task did not complete in time");
+    }
+
+    #[tokio::test]
+    async fn async_judge_job_persists_failures_in_task_status() {
+        let backend = GatedBackend::failure();
+        let app = build_router(backend.clone());
+        let payload = serde_json::to_vec(&sample_judge_job_request()).unwrap();
+
+        let response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/judge-jobs/async")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let accepted: JudgeJobTaskAccepted = response_json(response).await;
+        backend.started.notified().await;
+        backend.gate.notify_waiters();
+
+        for _ in 0..20 {
+            let failed_response = fetch_judge_job_task_response(&app, &accepted.task_id).await;
+            let failed: JudgeJobTaskResponse = response_json(failed_response).await;
+            if failed.status == ExecutionTaskStatus::Failed {
+                assert!(failed.report.is_none());
+                assert_eq!(
+                    failed.error.as_ref().map(|error| error.code.as_str()),
+                    Some("capability_unavailable")
+                );
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        panic!("async judge job task did not fail in time");
     }
 
     #[tokio::test]
@@ -3575,6 +3998,20 @@ enable_rootfs = false
         assert_eq!(
             body.error.message,
             "execution task `missing-task` was not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_judge_job_status_returns_not_found_for_unknown_task() {
+        let app = build_router(TestBackend);
+        let response = fetch_judge_job_task_response(&app, "missing-task").await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: ErrorResponse = response_json(response).await;
+        assert_eq!(body.error.code, "not_found");
+        assert_eq!(
+            body.error.message,
+            "judge job task `missing-task` was not found"
         );
     }
 }

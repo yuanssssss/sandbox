@@ -28,7 +28,9 @@
   完成/失败任务默认保留 5 分钟，最多保留 1024 条
 - [x] 已完成第 8 项：`/api/v1/executions/{task_id}/events` 已支持 SSE 事件流，
   会回放已有状态事件并在终态后自动断流
-- [ ] 当前下一步：给 `judge-jobs` 增加异步任务模型
+- [x] 已完成后续扩展：`judge-jobs` 已支持异步提交与任务状态查询，
+  完成后仍可继续按 `request_id` 读取 artifacts
+- [ ] 当前下一步：给内存中的 judge job artifact 注册表补 TTL、容量上限和清理策略
 
 ## 推荐顺序
 

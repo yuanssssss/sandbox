@@ -196,6 +196,8 @@ make docker-shell-prod
 - `GET /api/v1/executions/{task_id}`
 - `GET /api/v1/executions/{task_id}/events`
 - `POST /api/v1/judge-jobs`
+- `POST /api/v1/judge-jobs/async`
+- `GET /api/v1/judge-jobs/tasks/{task_id}`
 - `GET /api/v1/judge-jobs/{request_id}/artifacts`
 - `GET /api/v1/judge-jobs/{request_id}/artifacts/{stage}/file?path=...`
 
@@ -271,6 +273,41 @@ judge job artifact 索引示例：
 curl -sS http://127.0.0.1:3000/api/v1/judge-jobs/judge-pipeline-001/artifacts
 ```
 
+judge job 异步执行示例：
+
+```bash
+curl -sS http://127.0.0.1:3000/api/v1/judge-jobs/async \
+  -H 'content-type: application/json' \
+  -d '{
+    "request_id": "judge-run-only-async-001",
+    "run": {
+      "config": {
+        "process": {
+          "argv": ["/bin/echo", "hello"]
+        },
+        "limits": {
+          "wall_time_ms": 1000
+        },
+        "filesystem": {
+          "enable_rootfs": false
+        }
+      }
+    }
+  }'
+```
+
+异步 judge job 查询示例：
+
+```bash
+curl -sS http://127.0.0.1:3000/api/v1/judge-jobs/tasks/judge-1
+```
+
+judge job 异步任务当前也复用了和 execution async 一样的默认保留策略：
+
+- `completed` / `failed` 任务默认保留 5 分钟
+- 最多保留 1024 条 judge job 异步任务
+- 完成后最终 `JudgeJobReport` 会继续按原 `request_id` 写入内存 store，因此 artifact 路由不需要改调用方式
+
 judge job artifact 下载示例：
 
 ```bash
@@ -330,7 +367,7 @@ cargo run -p sandbox-cli -- run --config configs/minimal.toml --command /bin/ech
 
 1. 给 `judge-jobs` 增加异步任务模型，统一多阶段任务和事件流
 2. 给内存中的 judge job artifact 注册表补 TTL、容量上限和清理策略
-3. 继续补更强的编译阶段隔离和高风险语言运行时样例
+3. 给 judge job 补事件流或阶段级 SSE
 
 ## 验证
 

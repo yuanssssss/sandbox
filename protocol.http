@@ -237,6 +237,39 @@ GET {{baseUrl}}/api/v1/judge-jobs/judge-pipeline-001/artifacts/run/file?path=std
 Accept: text/plain
 
 ###
+# judge job 异步执行：创建任务
+POST {{baseUrl}}/api/v1/judge-jobs/async
+Content-Type: application/json
+Accept: application/json
+
+{
+  "request_id": "judge-run-only-async-001",
+  "artifact_dir": "/tmp/sandbox-protocol-http/judge-run-only-async-001",
+  "run": {
+    "command_override": ["/bin/sh", "-c", "sleep 1; echo judge async done"],
+    "config": {
+      "process": {
+        "argv": ["/bin/echo", "this will be replaced"],
+        "cwd": ".",
+        "env": ["LANG=C", "PATH=/usr/bin:/bin"],
+        "clear_env": true
+      },
+      "limits": {
+        "wall_time_ms": 5000
+      },
+      "filesystem": {
+        "enable_rootfs": false
+      }
+    }
+  }
+}
+
+###
+# judge job 异步执行：查询任务状态
+GET {{baseUrl}}/api/v1/judge-jobs/tasks/judge-1
+Accept: application/json
+
+###
 # 错误示例：路径逃逸会被拒绝，预期返回 400 invalid_request
 GET {{baseUrl}}/api/v1/judge-jobs/judge-pipeline-001/artifacts/compile/file?path=../secret
 Accept: application/json
