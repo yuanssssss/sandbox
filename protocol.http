@@ -5,6 +5,9 @@
 
 # 先启动协议服务：
 # cargo run -p sandbox-cli -- serve --listen 127.0.0.1:3000
+# 或：cargo run -p sandbox-cli -- serve --listen 127.0.0.1:3000 --server-config configs/protocol-server.toml
+# 如果启用了鉴权，可在请求里加：
+# Authorization: Bearer secret-token
 
 ###
 # 健康检查
@@ -268,6 +271,12 @@ Accept: application/json
 # judge job 异步执行：查询任务状态
 GET {{baseUrl}}/api/v1/judge-jobs/tasks/judge-1
 Accept: application/json
+
+###
+# judge job 异步执行：订阅任务事件流
+# 连接后会先回放当前 task 已有事件，再继续输出 task_status / stage 事件
+GET {{baseUrl}}/api/v1/judge-jobs/tasks/judge-1/events
+Accept: text/event-stream
 
 ###
 # 错误示例：路径逃逸会被拒绝，预期返回 400 invalid_request

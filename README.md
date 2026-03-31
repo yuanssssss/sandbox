@@ -135,6 +135,35 @@ cargo run -p sandbox-cli -- debug --config configs/minimal.toml
 cargo run -p sandbox-cli -- serve --listen 127.0.0.1:3000
 ```
 
+带保护参数启动 HTTP API：
+
+```bash
+SANDBOX_PROTOCOL_AUTH_TOKEN=secret-token \
+cargo run -p sandbox-cli -- serve \
+  --listen 127.0.0.1:3000 \
+  --max-request-body-bytes 1048576 \
+  --max-concurrent-requests 32
+```
+
+使用持久化配置文件启动 HTTP API：
+
+```bash
+cargo run -p sandbox-cli -- serve \
+  --listen 127.0.0.1:3000 \
+  --server-config configs/protocol-server.toml
+```
+
+配置文件样例见：
+
+- [configs/protocol-server.toml](/home/anyu/projects/sandbox/configs/protocol-server.toml)
+
+配置合并优先级：
+
+- CLI 显式参数
+- `--server-config` TOML 文件
+- 环境变量 `SANDBOX_PROTOCOL_AUTH_TOKEN` 或配置文件中声明的 `auth_token_env`
+- 内置默认值
+
 ## Docker 环境
 
 仓库根目录现在提供了两套容器环境：
@@ -198,8 +227,18 @@ make docker-shell-prod
 - `POST /api/v1/judge-jobs`
 - `POST /api/v1/judge-jobs/async`
 - `GET /api/v1/judge-jobs/tasks/{task_id}`
+- `GET /api/v1/judge-jobs/tasks/{task_id}/events`
 - `GET /api/v1/judge-jobs/{request_id}/artifacts`
 - `GET /api/v1/judge-jobs/{request_id}/artifacts/{stage}/file?path=...`
+
+接入层保护：
+
+- `GET /healthz` 默认不要求鉴权，方便探活
+- 其它 `/api/v1/...` 路由在配置了 token 后要求 `Authorization: Bearer <token>`
+- 默认请求体上限 `1 MiB`
+- 默认最多允许 32 个并发中的 API 请求
+- 超过请求体限制会返回 `413 request_too_large`
+- 超过并发上限会返回 `429 concurrency_limit_exceeded`
 
 同步执行示例：
 
@@ -302,11 +341,24 @@ curl -sS http://127.0.0.1:3000/api/v1/judge-jobs/async \
 curl -sS http://127.0.0.1:3000/api/v1/judge-jobs/tasks/judge-1
 ```
 
+异步 judge job 事件流示例：
+
+```bash
+curl -N http://127.0.0.1:3000/api/v1/judge-jobs/tasks/judge-1/events
+```
+
 judge job 异步任务当前也复用了和 execution async 一样的默认保留策略：
 
 - `completed` / `failed` 任务默认保留 5 分钟
 - 最多保留 1024 条 judge job 异步任务
 - 完成后最终 `JudgeJobReport` 会继续按原 `request_id` 写入内存 store，因此 artifact 路由不需要改调用方式
+- 事件流会先回放当前 task 已有的 `task_status` / `stage` 事件，再继续输出后续事件；终态后断流
+
+judge job artifact 注册表当前策略：
+
+- 已完成的 judge job 报告默认保留 5 分钟
+- 最多缓存 1024 条 judge job 报告
+- 达到上限后会淘汰最老的一条缓存报告，再写入新的结果
 
 judge job artifact 下载示例：
 
@@ -366,8 +418,8 @@ cargo run -p sandbox-cli -- run --config configs/minimal.toml --command /bin/ech
 优先继续做这些任务：
 
 1. 给 `judge-jobs` 增加异步任务模型，统一多阶段任务和事件流
-2. 给内存中的 judge job artifact 注册表补 TTL、容量上限和清理策略
-3. 给 judge job 补事件流或阶段级 SSE
+2. 给 judge job 补阶段级细粒度事件或统一事件模型
+3. 增加鉴权、中间件、请求大小限制和并发限制
 
 ## 验证
 

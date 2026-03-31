@@ -9,10 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_stream::stream;
+use axum::body::Body as AxumBody;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path as AxumPath, Query};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::http::Request;
 use axum::http::StatusCode;
-use axum::http::header::{CONTENT_TYPE, HeaderValue};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,10 +30,46 @@ use sandbox_supervisor::{
     probe_namespace_support, run,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, Semaphore, broadcast};
 use tracing::info;
 
 pub type BackendFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+#[derive(Debug, Clone)]
+pub struct ProtocolServerOptions {
+    pub auth_token: Option<String>,
+    pub max_request_body_bytes: usize,
+    pub max_concurrent_requests: usize,
+}
+
+impl Default for ProtocolServerOptions {
+    fn default() -> Self {
+        Self {
+            auth_token: None,
+            max_request_body_bytes: 1024 * 1024,
+            max_concurrent_requests: 32,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ApiMiddlewareState {
+    auth_token: Option<Arc<str>>,
+    max_request_body_bytes: usize,
+    max_concurrent_requests: usize,
+    semaphore: Arc<Semaphore>,
+}
+
+impl ApiMiddlewareState {
+    fn from_options(options: &ProtocolServerOptions) -> Self {
+        Self {
+            auth_token: options.auth_token.clone().map(Arc::<str>::from),
+            max_request_body_bytes: options.max_request_body_bytes,
+            max_concurrent_requests: options.max_concurrent_requests,
+            semaphore: Arc::new(Semaphore::new(options.max_concurrent_requests.max(1))),
+        }
+    }
+}
 
 pub trait ProtocolBackend: Send + Sync + 'static {
     fn health(&self) -> BackendFuture<HealthStatus>;
@@ -453,6 +492,28 @@ pub struct JudgeJobTaskResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgeJobTaskEvent {
+    pub sequence: u64,
+    pub task_id: String,
+    pub request_id: String,
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<ExecutionTaskStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    pub message: String,
+}
+
+impl JudgeJobTaskEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            Some(ExecutionTaskStatus::Completed | ExecutionTaskStatus::Failed)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionTaskEvent {
     pub sequence: u64,
     pub task_id: String,
@@ -740,6 +801,35 @@ fn async_task_capacity_exceeded_error(max_tasks: usize, request_id: &str) -> Pro
             "async execution task capacity exceeded: at most {max_tasks} retained tasks are allowed"
         ),
         Some(request_id.to_string()),
+    )
+}
+
+fn unauthorized_error() -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "missing or invalid bearer token",
+        None,
+    )
+}
+
+fn request_too_large_error(limit: usize) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "request_too_large",
+        format!("request body exceeds the configured limit of {limit} bytes"),
+        None,
+    )
+}
+
+fn concurrency_limit_exceeded_error(limit: usize) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "concurrency_limit_exceeded",
+        format!(
+            "server concurrency limit exceeded: at most {limit} in-flight requests are allowed"
+        ),
+        None,
     )
 }
 
@@ -1275,6 +1365,50 @@ fn content_type_for_artifact(path: &Path) -> &'static str {
     }
 }
 
+fn authorization_matches_expected(header: Option<&HeaderValue>, expected_token: &str) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let Ok(raw) = header.to_str() else {
+        return false;
+    };
+    let Some(token) = raw.strip_prefix("Bearer ") else {
+        return false;
+    };
+    token == expected_token
+}
+
+async fn api_guard_middleware(
+    State(state): State<ApiMiddlewareState>,
+    request: Request<AxumBody>,
+    next: Next,
+) -> Result<Response, ProtocolError> {
+    if let Some(expected_token) = state.auth_token.as_deref() {
+        if !authorization_matches_expected(request.headers().get(AUTHORIZATION), expected_token) {
+            return Err(unauthorized_error());
+        }
+    }
+
+    if let Some(content_length) = request.headers().get(CONTENT_LENGTH) {
+        if let Ok(raw) = content_length.to_str() {
+            if let Ok(length) = raw.parse::<usize>() {
+                if length > state.max_request_body_bytes {
+                    return Err(request_too_large_error(state.max_request_body_bytes));
+                }
+            }
+        }
+    }
+
+    let permit = state
+        .semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| concurrency_limit_exceeded_error(state.max_concurrent_requests))?;
+    let response = next.run(request).await;
+    drop(permit);
+    Ok(response)
+}
+
 fn failed_stage_report(
     stage: JudgeStageName,
     request: JudgeStageRequest,
@@ -1609,6 +1743,30 @@ fn execution_task_sse_event(event: &ExecutionTaskEvent) -> Result<Event, Protoco
         })
 }
 
+fn judge_job_task_event_message(status: ExecutionTaskStatus) -> &'static str {
+    match status {
+        ExecutionTaskStatus::Accepted => "judge job task accepted",
+        ExecutionTaskStatus::Running => "judge job task running",
+        ExecutionTaskStatus::Completed => "judge job task completed",
+        ExecutionTaskStatus::Failed => "judge job task failed",
+    }
+}
+
+fn judge_job_task_sse_event(event: &JudgeJobTaskEvent) -> Result<Event, ProtocolError> {
+    Event::default()
+        .event(&event.event_type)
+        .id(event.sequence.to_string())
+        .json_data(event)
+        .map_err(|err| {
+            ProtocolError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("failed to serialize judge job task event: {err}"),
+                Some(event.request_id.clone()),
+            )
+        })
+}
+
 struct ExecutionTaskManager<B> {
     backend: Arc<B>,
     next_task_id: AtomicU64,
@@ -1652,6 +1810,9 @@ struct JudgeJobTaskManager<B> {
 struct StoredJudgeJobTask {
     response: JudgeJobTaskResponse,
     completed_at: Option<Instant>,
+    next_event_sequence: u64,
+    event_history: Vec<JudgeJobTaskEvent>,
+    event_sender: broadcast::Sender<JudgeJobTaskEvent>,
 }
 
 impl<B> ExecutionTaskManager<B>
@@ -1818,14 +1979,30 @@ where
         }
     }
 
-    async fn submit(&self, request: JudgeJobRequest) -> Result<JudgeJobTaskAccepted, ProtocolError> {
+    async fn submit(
+        &self,
+        request: JudgeJobRequest,
+    ) -> Result<JudgeJobTaskAccepted, ProtocolError> {
         request.validate()?;
         let request_id = request.request_id.clone();
-        let task_id = format!("judge-{}", self.next_task_id.fetch_add(1, Ordering::Relaxed));
+        let task_id = format!(
+            "judge-{}",
+            self.next_task_id.fetch_add(1, Ordering::Relaxed)
+        );
         let accepted = JudgeJobTaskAccepted {
             task_id: task_id.clone(),
             request_id: request_id.clone(),
             status: ExecutionTaskStatus::Accepted,
+        };
+        let (event_sender, _) = broadcast::channel(32);
+        let accepted_event = JudgeJobTaskEvent {
+            sequence: 0,
+            task_id: task_id.clone(),
+            request_id: request_id.clone(),
+            event_type: "task_status".to_string(),
+            status: Some(ExecutionTaskStatus::Accepted),
+            stage: None,
+            message: judge_job_task_event_message(ExecutionTaskStatus::Accepted).to_string(),
         };
 
         let mut tasks = self.tasks.write().await;
@@ -1847,6 +2024,9 @@ where
                     error: None,
                 },
                 completed_at: None,
+                next_event_sequence: 1,
+                event_history: vec![accepted_event],
+                event_sender,
             },
         );
         drop(tasks);
@@ -1856,11 +2036,18 @@ where
         let tasks = Arc::clone(&self.tasks);
         let retention = self.retention;
         tokio::spawn(async move {
-            update_judge_job_task_status(&tasks, &task_id, ExecutionTaskStatus::Running, None, None)
-                .await;
+            update_judge_job_task_status(
+                &tasks,
+                &task_id,
+                ExecutionTaskStatus::Running,
+                None,
+                None,
+            )
+            .await;
             match backend.execute_judge_job(request).await {
                 Ok(report) => {
                     store.insert(report.clone()).await;
+                    append_judge_job_audit_events(&tasks, &task_id, &report.audit_events).await;
                     update_judge_job_task_status(
                         &tasks,
                         &task_id,
@@ -1897,6 +2084,24 @@ where
             .map(|task| task.response.clone())
     }
 
+    async fn subscribe(
+        &self,
+        task_id: &str,
+    ) -> Result<
+        (
+            Vec<JudgeJobTaskEvent>,
+            broadcast::Receiver<JudgeJobTaskEvent>,
+        ),
+        ProtocolError,
+    > {
+        self.prune_expired_tasks().await;
+        let tasks = self.tasks.read().await;
+        let task = tasks
+            .get(task_id)
+            .ok_or_else(|| judge_job_task_not_found_error(task_id))?;
+        Ok((task.event_history.clone(), task.event_sender.subscribe()))
+    }
+
     async fn prune_expired_tasks(&self) {
         prune_expired_judge_job_tasks_with_policy(&self.tasks, self.retention).await;
     }
@@ -1904,26 +2109,63 @@ where
 
 #[derive(Debug, Default)]
 struct JudgeJobStore {
-    jobs: Arc<RwLock<HashMap<String, JudgeJobReport>>>,
+    retention: JudgeJobStoreRetentionPolicy,
+    jobs: Arc<RwLock<HashMap<String, StoredJudgeJobReport>>>,
 }
 
 impl JudgeJobStore {
     fn new() -> Self {
+        Self::with_policy(JudgeJobStoreRetentionPolicy::default())
+    }
+
+    fn with_policy(retention: JudgeJobStoreRetentionPolicy) -> Self {
         Self {
+            retention,
             jobs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     async fn insert(&self, report: JudgeJobReport) {
-        self.jobs
-            .write()
-            .await
-            .insert(report.request.request_id.clone(), report);
+        let now = Instant::now();
+        let mut jobs = self.jobs.write().await;
+        prune_expired_judge_job_reports_locked(&mut jobs, self.retention, now);
+        evict_judge_job_reports_to_capacity(&mut jobs, self.retention.max_jobs);
+        jobs.insert(
+            report.request.request_id.clone(),
+            StoredJudgeJobReport {
+                report,
+                stored_at: now,
+            },
+        );
     }
 
     async fn get(&self, request_id: &str) -> Option<JudgeJobReport> {
-        self.jobs.read().await.get(request_id).cloned()
+        let now = Instant::now();
+        let mut jobs = self.jobs.write().await;
+        prune_expired_judge_job_reports_locked(&mut jobs, self.retention, now);
+        jobs.get(request_id).map(|entry| entry.report.clone())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JudgeJobStoreRetentionPolicy {
+    ttl: Duration,
+    max_jobs: usize,
+}
+
+impl Default for JudgeJobStoreRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(5 * 60),
+            max_jobs: 1_024,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoredJudgeJobReport {
+    report: JudgeJobReport,
+    stored_at: Instant,
 }
 
 async fn update_task_status(
@@ -1969,11 +2211,47 @@ async fn update_judge_job_task_status(
         task.response.status = status;
         task.response.report = report;
         task.response.error = error;
+        let event = JudgeJobTaskEvent {
+            sequence: task.next_event_sequence,
+            task_id: task.response.task_id.clone(),
+            request_id: task.response.request_id.clone(),
+            event_type: "task_status".to_string(),
+            status: Some(status),
+            stage: None,
+            message: judge_job_task_event_message(status).to_string(),
+        };
+        task.next_event_sequence += 1;
+        task.event_history.push(event.clone());
+        let _ = task.event_sender.send(event);
         task.completed_at = matches!(
             status,
             ExecutionTaskStatus::Completed | ExecutionTaskStatus::Failed
         )
         .then_some(Instant::now());
+    }
+}
+
+async fn append_judge_job_audit_events(
+    tasks: &RwLock<HashMap<String, StoredJudgeJobTask>>,
+    task_id: &str,
+    audit_events: &[AuditEvent],
+) {
+    let mut guard = tasks.write().await;
+    if let Some(task) = guard.get_mut(task_id) {
+        for audit_event in audit_events {
+            let event = JudgeJobTaskEvent {
+                sequence: task.next_event_sequence,
+                task_id: task.response.task_id.clone(),
+                request_id: task.response.request_id.clone(),
+                event_type: "stage".to_string(),
+                status: None,
+                stage: Some(audit_event.stage.clone()),
+                message: audit_event.message.clone(),
+            };
+            task.next_event_sequence += 1;
+            task.event_history.push(event.clone());
+            let _ = task.event_sender.send(event);
+        }
     }
 }
 
@@ -2019,11 +2297,48 @@ fn prune_expired_judge_job_tasks_locked(
     });
 }
 
+fn prune_expired_judge_job_reports_locked(
+    jobs: &mut HashMap<String, StoredJudgeJobReport>,
+    retention: JudgeJobStoreRetentionPolicy,
+    now: Instant,
+) {
+    jobs.retain(|_, entry| now.duration_since(entry.stored_at) < retention.ttl);
+}
+
+fn evict_judge_job_reports_to_capacity(
+    jobs: &mut HashMap<String, StoredJudgeJobReport>,
+    max_jobs: usize,
+) {
+    if max_jobs == 0 {
+        jobs.clear();
+        return;
+    }
+
+    while jobs.len() >= max_jobs {
+        let Some(oldest_key) = jobs
+            .iter()
+            .min_by_key(|(_, entry)| entry.stored_at)
+            .map(|(request_id, _)| request_id.clone())
+        else {
+            break;
+        };
+        jobs.remove(&oldest_key);
+    }
+}
+
 pub fn build_router<B>(backend: B) -> Router
 where
     B: ProtocolBackend,
 {
+    build_router_with_options(backend, ProtocolServerOptions::default())
+}
+
+pub fn build_router_with_options<B>(backend: B, options: ProtocolServerOptions) -> Router
+where
+    B: ProtocolBackend,
+{
     let backend = Arc::new(backend);
+    let api_middleware_state = ApiMiddlewareState::from_options(&options);
     let health_backend = Arc::clone(&backend);
     let capabilities_backend = Arc::clone(&backend);
     let validate_backend = Arc::clone(&backend);
@@ -2039,18 +2354,12 @@ where
     ));
     let async_judge_job_submit_manager = Arc::clone(&async_judge_job_manager);
     let async_judge_job_status_manager = Arc::clone(&async_judge_job_manager);
+    let async_judge_job_events_manager = Arc::clone(&async_judge_job_manager);
     let async_submit_manager = Arc::new(ExecutionTaskManager::new(Arc::clone(&backend)));
     let async_status_manager = Arc::clone(&async_submit_manager);
     let async_events_manager = Arc::clone(&async_submit_manager);
 
-    Router::new()
-        .route(
-            "/healthz",
-            get(move || {
-                let backend = Arc::clone(&health_backend);
-                async move { Json(backend.health().await) }
-            }),
-        )
+    let api_router = Router::new()
         .route(
             "/api/v1/capabilities",
             get(move || {
@@ -2122,6 +2431,43 @@ where
                         .await
                         .ok_or_else(|| judge_job_task_not_found_error(&task_id))
                         .map(Json)
+                }
+            }),
+        )
+        .route(
+            "/api/v1/judge-jobs/tasks/{task_id}/events",
+            get(move |AxumPath(task_id): AxumPath<String>| {
+                let manager = Arc::clone(&async_judge_job_events_manager);
+                async move {
+                    let (history, mut receiver) = manager.subscribe(&task_id).await?;
+                    let stream = stream! {
+                        for event in history {
+                            let terminal = event.is_terminal();
+                            yield judge_job_task_sse_event(&event);
+                            if terminal {
+                                return;
+                            }
+                        }
+
+                        loop {
+                            match receiver.recv().await {
+                                Ok(event) => {
+                                    let terminal = event.is_terminal();
+                                    yield judge_job_task_sse_event(&event);
+                                    if terminal {
+                                        break;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    continue;
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
+                            }
+                        }
+                    };
+                    Ok::<_, ProtocolError>(Sse::new(stream).keep_alive(KeepAlive::default()))
                 }
             }),
         )
@@ -2227,18 +2573,44 @@ where
                 }
             }),
         )
+        .layer(DefaultBodyLimit::max(options.max_request_body_bytes))
+        .route_layer(middleware::from_fn_with_state(
+            api_middleware_state,
+            api_guard_middleware,
+        ));
+
+    Router::new()
+        .route(
+            "/healthz",
+            get(move || {
+                let backend = Arc::clone(&health_backend);
+                async move { Json(backend.health().await) }
+            }),
+        )
+        .merge(api_router)
         .method_not_allowed_fallback(|| async { method_not_allowed_error() })
         .fallback(|| async { not_found_error() })
 }
 
 pub fn default_router() -> Router {
-    build_router(SupervisorBackend)
+    build_router_with_options(SupervisorBackend, ProtocolServerOptions::default())
 }
 
 pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
+    serve_with_options(addr, ProtocolServerOptions::default()).await
+}
+
+pub async fn serve_with_options(
+    addr: SocketAddr,
+    options: ProtocolServerOptions,
+) -> std::io::Result<()> {
     info!(%addr, "starting sandbox protocol server");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, default_router()).await
+    axum::serve(
+        listener,
+        build_router_with_options(SupervisorBackend, options),
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3369,6 +3741,99 @@ enable_rootfs = false
         assert_eq!(body.error.request_id, None);
     }
 
+    #[tokio::test]
+    async fn healthz_remains_accessible_when_auth_is_enabled() {
+        let app = build_router_with_options(
+            TestBackend,
+            ProtocolServerOptions {
+                auth_token: Some("secret-token".to_string()),
+                ..ProtocolServerOptions::default()
+            },
+        );
+        let response = send(
+            &app,
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_routes_require_bearer_auth_when_configured() {
+        let app = build_router_with_options(
+            TestBackend,
+            ProtocolServerOptions {
+                auth_token: Some("secret-token".to_string()),
+                ..ProtocolServerOptions::default()
+            },
+        );
+        let payload = serde_json::to_vec(&ExecutionRequest {
+            request_id: "auth-run-001".to_string(),
+            config: sample_config(),
+            command_override: None,
+            artifact_dir: None,
+        })
+        .unwrap();
+
+        let unauthorized_response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/executions")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(unauthorized_response.status(), StatusCode::UNAUTHORIZED);
+        let unauthorized_body: ErrorResponse = response_json(unauthorized_response).await;
+        assert_eq!(unauthorized_body.error.code, "unauthorized");
+
+        let authorized_response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/executions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret-token")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(authorized_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn body_limit_rejects_large_requests() {
+        let app = build_router_with_options(
+            TestBackend,
+            ProtocolServerOptions {
+                max_request_body_bytes: 16,
+                ..ProtocolServerOptions::default()
+            },
+        );
+        let payload = vec![b'a'; 128];
+        let response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/executions")
+                .header("content-type", "application/json")
+                .header("content-length", payload.len().to_string())
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: ErrorResponse = response_json(response).await;
+        assert_eq!(body.error.code, "request_too_large");
+    }
+
     #[derive(Clone)]
     struct GatedBackend {
         gate: Arc<Notify>,
@@ -3614,6 +4079,18 @@ enable_rootfs = false
         .await
     }
 
+    async fn fetch_judge_job_task_events_response(app: &Router, task_id: &str) -> Response {
+        send(
+            app,
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/judge-jobs/tasks/{task_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn async_execute_returns_accepted_and_completed_status() {
         let backend = GatedBackend::success();
@@ -3673,6 +4150,60 @@ enable_rootfs = false
         }
 
         panic!("async execution task did not complete in time");
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_rejects_parallel_api_requests() {
+        let backend = GatedBackend::success();
+        let app = build_router_with_options(
+            backend.clone(),
+            ProtocolServerOptions {
+                max_concurrent_requests: 1,
+                ..ProtocolServerOptions::default()
+            },
+        );
+        let payload = serde_json::to_vec(&ExecutionRequest {
+            request_id: "concurrency-run-001".to_string(),
+            config: sample_config(),
+            command_override: None,
+            artifact_dir: None,
+        })
+        .unwrap();
+
+        let app_for_first = app.clone();
+        let first_request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/executions")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.clone()))
+            .unwrap();
+        let first_handle = tokio::spawn(async move {
+            app_for_first
+                .oneshot(first_request)
+                .await
+                .expect("first request should execute")
+        });
+
+        backend.started.notified().await;
+
+        let second_response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/executions")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(second_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let second_body: ErrorResponse = response_json(second_response).await;
+        assert_eq!(second_body.error.code, "concurrency_limit_exceeded");
+
+        backend.gate.notify_waiters();
+        let first_response = first_handle.await.expect("first request task should join");
+        assert_eq!(first_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3930,6 +4461,86 @@ enable_rootfs = false
     }
 
     #[tokio::test]
+    async fn judge_job_store_prunes_reports_after_ttl() {
+        let store = JudgeJobStore::with_policy(JudgeJobStoreRetentionPolicy {
+            ttl: Duration::from_millis(20),
+            max_jobs: 4,
+        });
+        let request = sample_judge_job_request();
+        let request_id = request.request_id.clone();
+        let report = JudgeJobReport {
+            request: request.clone(),
+            status: JudgeJobStatus::Completed,
+            compile: None,
+            run: JudgeStageReport {
+                stage: JudgeStageName::Run,
+                request: request.run,
+                status: JudgeStageStatus::Completed,
+                artifact_dir: Some(unique_test_artifact_dir("judge-store-ttl")),
+                result: None,
+                compilation_result: None,
+                artifacts: Vec::new(),
+                audit_events: Vec::new(),
+                error: None,
+            },
+            checker: None,
+            audit_events: Vec::new(),
+        };
+        store.insert(report).await;
+
+        assert!(store.get(&request_id).await.is_some());
+        thread::sleep(Duration::from_millis(30));
+        assert!(store.get(&request_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn judge_job_store_evicts_oldest_reports_when_capacity_is_reached() {
+        let store = JudgeJobStore::with_policy(JudgeJobStoreRetentionPolicy {
+            ttl: Duration::from_secs(60),
+            max_jobs: 2,
+        });
+
+        for request_id in ["judge-store-001", "judge-store-002", "judge-store-003"] {
+            let request = JudgeJobRequest {
+                request_id: request_id.to_string(),
+                artifact_dir: Some(unique_test_artifact_dir(request_id)),
+                compile: None,
+                run: JudgeStageRequest {
+                    config: sample_config(),
+                    command_override: None,
+                    artifact_dir: None,
+                    inputs: JudgeStageInputs::default(),
+                },
+                checker: None,
+            };
+            let report = JudgeJobReport {
+                request: request.clone(),
+                status: JudgeJobStatus::Completed,
+                compile: None,
+                run: JudgeStageReport {
+                    stage: JudgeStageName::Run,
+                    request: request.run,
+                    status: JudgeStageStatus::Completed,
+                    artifact_dir: Some(unique_test_artifact_dir(request_id)),
+                    result: None,
+                    compilation_result: None,
+                    artifacts: Vec::new(),
+                    audit_events: Vec::new(),
+                    error: None,
+                },
+                checker: None,
+                audit_events: Vec::new(),
+            };
+            store.insert(report).await;
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(store.get("judge-store-001").await.is_none());
+        assert!(store.get("judge-store-002").await.is_some());
+        assert!(store.get("judge-store-003").await.is_some());
+    }
+
+    #[tokio::test]
     async fn async_status_returns_not_found_for_unknown_task() {
         let app = build_router(TestBackend);
         let response = fetch_task_response(&app, "missing-task").await;
@@ -4002,9 +4613,66 @@ enable_rootfs = false
     }
 
     #[tokio::test]
+    async fn async_judge_job_events_stream_replays_status_and_stage_events() {
+        let app = build_router(TestBackend);
+        let payload = serde_json::to_vec(&sample_multi_stage_judge_job_request()).unwrap();
+
+        let response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/judge-jobs/async")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let accepted: JudgeJobTaskAccepted = response_json(response).await;
+
+        for _ in 0..20 {
+            let completed_response = fetch_judge_job_task_response(&app, &accepted.task_id).await;
+            let completed: JudgeJobTaskResponse = response_json(completed_response).await;
+            if completed.status == ExecutionTaskStatus::Completed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let events_response = fetch_judge_job_task_events_response(&app, &accepted.task_id).await;
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let bytes = to_bytes(events_response.into_body(), usize::MAX)
+            .await
+            .expect("judge job sse body should be readable");
+        let body = String::from_utf8(bytes.to_vec()).expect("judge job sse body should be utf-8");
+
+        assert!(body.contains("event: task_status"));
+        assert!(body.contains("event: stage"));
+        assert!(body.contains("\"status\":\"accepted\""));
+        assert!(body.contains("\"status\":\"running\""));
+        assert!(body.contains("\"status\":\"completed\""));
+        assert!(body.contains("\"stage\":\"compile_started\""));
+        assert!(body.contains("\"stage\":\"completed\""));
+    }
+
+    #[tokio::test]
     async fn async_judge_job_status_returns_not_found_for_unknown_task() {
         let app = build_router(TestBackend);
         let response = fetch_judge_job_task_response(&app, "missing-task").await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: ErrorResponse = response_json(response).await;
+        assert_eq!(body.error.code, "not_found");
+        assert_eq!(
+            body.error.message,
+            "judge job task `missing-task` was not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_judge_job_events_returns_not_found_for_unknown_task() {
+        let app = build_router(TestBackend);
+        let response = fetch_judge_job_task_events_response(&app, "missing-task").await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body: ErrorResponse = response_json(response).await;

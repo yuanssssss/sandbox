@@ -30,7 +30,14 @@
   会回放已有状态事件并在终态后自动断流
 - [x] 已完成后续扩展：`judge-jobs` 已支持异步提交与任务状态查询，
   完成后仍可继续按 `request_id` 读取 artifacts
-- [ ] 当前下一步：给内存中的 judge job artifact 注册表补 TTL、容量上限和清理策略
+- [x] 已完成后续扩展：judge job artifact 注册表已补默认保留期、容量上限和淘汰策略，
+  默认保留 5 分钟，最多保留 1024 条，超限时淘汰最老缓存
+- [x] 已完成后续扩展：`/api/v1/judge-jobs/tasks/{task_id}/events` 已支持 SSE，
+  会回放 task_status / stage 事件并在终态后断流
+- [x] 已完成后续扩展：协议服务已补 Bearer 鉴权、请求体大小限制和并发限制，
+  `healthz` 默认保持免鉴权
+- [x] 已完成后续扩展：`sandbox-cli serve` 已支持 `--server-config`，可持久化保存鉴权和限制参数
+- [ ] 当前下一步：如果继续工程化，可优先补细粒度权限和统一事件模型
 
 ## 推荐顺序
 

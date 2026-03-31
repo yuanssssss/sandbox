@@ -10,12 +10,12 @@ use sandbox_config::ExecutionConfig;
 use sandbox_core::{
     CompilationResult, CompilationStatus, ExecutionResult, ExecutionStatus, SandboxError,
 };
-use sandbox_protocol::serve as serve_protocol;
+use sandbox_protocol::{ProtocolServerOptions, serve_with_options as serve_protocol};
 use sandbox_supervisor::{
     CompileOptions, NamespaceSupport, RunOptions, cgroup_scope_name, compile, planned_artifact_dir,
     probe_namespace_support, rootfs_cwd, run,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -106,6 +106,14 @@ struct DebugArgs {
 struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:3000")]
     listen: SocketAddr,
+    #[arg(long)]
+    server_config: Option<PathBuf>,
+    #[arg(long)]
+    auth_token: Option<String>,
+    #[arg(long)]
+    max_request_body_bytes: Option<usize>,
+    #[arg(long)]
+    max_concurrent_requests: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -288,6 +296,15 @@ struct DebugReport {
     exit_code: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProtocolServerFileConfig {
+    auth_token: Option<String>,
+    auth_token_env: Option<String>,
+    auth_token_file: Option<PathBuf>,
+    max_request_body_bytes: Option<usize>,
+    max_concurrent_requests: Option<usize>,
+}
+
 fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -339,6 +356,62 @@ fn init_tracing(cli: &Cli) -> AnyhowResult<()> {
     }
 
     Ok(())
+}
+
+fn load_server_file_config(path: &Path) -> AnyhowResult<ProtocolServerFileConfig> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read server config from {}", path.display()))?;
+    toml::from_str(&raw)
+        .with_context(|| format!("failed to parse server config from {}", path.display()))
+}
+
+fn resolve_server_auth_token(
+    cli_auth_token: Option<String>,
+    file_config: &ProtocolServerFileConfig,
+) -> AnyhowResult<Option<String>> {
+    if cli_auth_token.is_some() {
+        return Ok(cli_auth_token);
+    }
+    if file_config.auth_token.is_some() {
+        return Ok(file_config.auth_token.clone());
+    }
+    if let Some(path) = file_config.auth_token_file.as_ref() {
+        let token = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read auth token file {}", path.display()))?;
+        return Ok(Some(token.trim().to_string()));
+    }
+    if let Some(env_name) = file_config.auth_token_env.as_deref() {
+        return Ok(std::env::var(env_name).ok());
+    }
+
+    Ok(std::env::var("SANDBOX_PROTOCOL_AUTH_TOKEN").ok())
+}
+
+fn resolve_server_options(
+    args: &ServeArgs,
+    file_config: &ProtocolServerFileConfig,
+) -> AnyhowResult<ProtocolServerOptions> {
+    let max_request_body_bytes = args
+        .max_request_body_bytes
+        .or(file_config.max_request_body_bytes)
+        .unwrap_or(1024 * 1024);
+    if max_request_body_bytes == 0 {
+        anyhow::bail!("max_request_body_bytes must be greater than 0");
+    }
+
+    let max_concurrent_requests = args
+        .max_concurrent_requests
+        .or(file_config.max_concurrent_requests)
+        .unwrap_or(32);
+    if max_concurrent_requests == 0 {
+        anyhow::bail!("max_concurrent_requests must be greater than 0");
+    }
+
+    Ok(ProtocolServerOptions {
+        auth_token: resolve_server_auth_token(args.auth_token.clone(), file_config)?,
+        max_request_body_bytes,
+        max_concurrent_requests,
+    })
 }
 
 fn compile_command(args: CompileArgs) -> std::result::Result<i32, CliErrorReport> {
@@ -465,7 +538,15 @@ fn debug_command(args: DebugArgs) -> std::result::Result<i32, CliErrorReport> {
 }
 
 async fn serve_command(args: ServeArgs) -> std::result::Result<i32, CliErrorReport> {
-    serve_protocol(args.listen)
+    let file_config = match args.server_config.as_deref() {
+        Some(path) => load_server_file_config(path)
+            .map_err(|err| build_error_report("serve", &err, ResultFormat::Pretty))?,
+        None => ProtocolServerFileConfig::default(),
+    };
+    let options = resolve_server_options(&args, &file_config)
+        .map_err(|err| build_error_report("serve", &err, ResultFormat::Pretty))?;
+
+    serve_protocol(args.listen, options)
         .await
         .with_context(|| format!("failed to serve sandbox protocol on {}", args.listen))
         .map_err(|err| build_error_report("serve", &err, ResultFormat::Pretty))?;
@@ -1505,15 +1586,18 @@ fn format_optional_i32(value: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CliErrorCategory, DebugReport, ResultFormat, build_error_report, build_inspect_report,
-        cgroup_limits_enabled, compilation_status_label, compile_outcome_label,
-        format_optional_i32, format_optional_u64, format_result_measurement,
-        format_result_term_signal, print_validate_summary, render_pretty_compilation_result,
-        render_pretty_debug_report, render_pretty_error_report, render_pretty_inspect_report,
-        render_pretty_result, run_outcome_label, status_label,
+        CliErrorCategory, DebugReport, ProtocolServerFileConfig, ResultFormat, ServeArgs,
+        build_error_report, build_inspect_report, cgroup_limits_enabled, compilation_status_label,
+        compile_outcome_label, format_optional_i32, format_optional_u64, format_result_measurement,
+        format_result_term_signal, load_server_file_config, print_validate_summary,
+        render_pretty_compilation_result, render_pretty_debug_report, render_pretty_error_report,
+        render_pretty_inspect_report, render_pretty_result, resolve_server_options,
+        run_outcome_label, status_label,
     };
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{
@@ -1821,5 +1905,84 @@ mod tests {
         assert!(rendered.contains("inspect: ok"));
         assert!(rendered.contains("error: Sandbox payload could not be started"));
         assert!(rendered.contains("debug_exit_code: 4"));
+    }
+
+    fn unique_temp_path(prefix: &str, suffix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("sandbox-cli-{prefix}-{stamp}{suffix}"))
+    }
+
+    #[test]
+    fn loads_server_file_config_from_toml() {
+        let path = unique_temp_path("server-config", ".toml");
+        fs::write(
+            &path,
+            r#"
+auth_token_env = "SANDBOX_PROTOCOL_AUTH_TOKEN_TEST"
+max_request_body_bytes = 2048
+max_concurrent_requests = 7
+"#,
+        )
+        .expect("server config should be written");
+
+        let config = load_server_file_config(&path).expect("server config should load");
+        assert_eq!(
+            config.auth_token_env.as_deref(),
+            Some("SANDBOX_PROTOCOL_AUTH_TOKEN_TEST")
+        );
+        assert_eq!(config.max_request_body_bytes, Some(2048));
+        assert_eq!(config.max_concurrent_requests, Some(7));
+    }
+
+    #[test]
+    fn resolve_server_options_prefers_cli_over_file_values() {
+        let args = ServeArgs {
+            listen: "127.0.0.1:3000".parse().unwrap(),
+            server_config: Some(PathBuf::from("configs/protocol-server.toml")),
+            auth_token: Some("cli-token".to_string()),
+            max_request_body_bytes: Some(4096),
+            max_concurrent_requests: Some(9),
+        };
+        let file_config = ProtocolServerFileConfig {
+            auth_token: Some("file-token".to_string()),
+            auth_token_env: Some("IGNORED_ENV".to_string()),
+            auth_token_file: None,
+            max_request_body_bytes: Some(2048),
+            max_concurrent_requests: Some(5),
+        };
+
+        let options = resolve_server_options(&args, &file_config).expect("options should resolve");
+        assert_eq!(options.auth_token.as_deref(), Some("cli-token"));
+        assert_eq!(options.max_request_body_bytes, 4096);
+        assert_eq!(options.max_concurrent_requests, 9);
+    }
+
+    #[test]
+    fn resolve_server_options_reads_token_file_when_requested() {
+        let token_path = unique_temp_path("server-token", ".txt");
+        fs::write(&token_path, "file-token\n").expect("token file should be written");
+
+        let args = ServeArgs {
+            listen: "127.0.0.1:3000".parse().unwrap(),
+            server_config: None,
+            auth_token: None,
+            max_request_body_bytes: None,
+            max_concurrent_requests: None,
+        };
+        let file_config = ProtocolServerFileConfig {
+            auth_token: None,
+            auth_token_env: None,
+            auth_token_file: Some(token_path),
+            max_request_body_bytes: None,
+            max_concurrent_requests: None,
+        };
+
+        let options = resolve_server_options(&args, &file_config).expect("options should resolve");
+        assert_eq!(options.auth_token.as_deref(), Some("file-token"));
+        assert_eq!(options.max_request_body_bytes, 1024 * 1024);
+        assert_eq!(options.max_concurrent_requests, 32);
     }
 }

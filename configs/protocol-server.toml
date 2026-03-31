@@ -1,0 +1,9 @@
+# Protocol service configuration example.
+# CLI flags still take precedence over this file.
+
+# auth_token = "replace-me"
+# auth_token_env = "SANDBOX_PROTOCOL_AUTH_TOKEN"
+# auth_token_file = "/run/secrets/sandbox_protocol_token"
+
+max_request_body_bytes = 1048576
+max_concurrent_requests = 32
