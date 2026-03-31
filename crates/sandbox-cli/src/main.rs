@@ -1,11 +1,16 @@
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::{Context, Error as AnyhowError, Result as AnyhowResult};
 use clap::{Parser, Subcommand, ValueEnum};
+use sandbox_cgroup::{CgroupManager, CgroupPlan};
 use sandbox_config::ExecutionConfig;
 use sandbox_core::{ExecutionResult, ExecutionStatus, SandboxError};
-use sandbox_supervisor::{RunOptions, run};
+use sandbox_supervisor::{
+    NamespaceSupport, RunOptions, cgroup_scope_name, planned_artifact_dir, probe_namespace_support,
+    rootfs_cwd, run,
+};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
@@ -31,6 +36,8 @@ enum LogFormat {
 enum Commands {
     Run(RunArgs),
     Validate(ValidateArgs),
+    Inspect(InspectArgs),
+    Debug(DebugArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -49,6 +56,28 @@ struct RunArgs {
 struct ValidateArgs {
     #[arg(long)]
     config: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+struct InspectArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    artifact_dir: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = ResultFormat::Pretty)]
+    result_format: ResultFormat,
+    #[arg(long, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, Parser)]
+struct DebugArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    artifact_dir: Option<PathBuf>,
+    #[arg(long, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -156,6 +185,81 @@ struct CliErrorReport {
     output_format: ResultFormat,
 }
 
+#[derive(Debug, Serialize)]
+struct InspectReport {
+    operation: &'static str,
+    config_path: PathBuf,
+    artifact_dir: PathBuf,
+    artifact_dir_source: &'static str,
+    command: Vec<String>,
+    command_override_applied: bool,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    stdout_within_artifact_dir: bool,
+    stderr_within_artifact_dir: bool,
+    process_cwd: Option<PathBuf>,
+    sandbox_cwd: Option<PathBuf>,
+    cgroup: InspectCgroup,
+    filesystem: InspectFilesystem,
+    host_support: InspectHostSupport,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectCgroup {
+    enabled: bool,
+    root: Option<PathBuf>,
+    scope_name: Option<String>,
+    path: Option<PathBuf>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectFilesystem {
+    rootfs_enabled: bool,
+    rootfs_dir: Option<PathBuf>,
+    host_work_dir: Option<PathBuf>,
+    host_tmp_dir: Option<PathBuf>,
+    host_output_dir: Option<PathBuf>,
+    sandbox_work_dir: PathBuf,
+    sandbox_tmp_dir: PathBuf,
+    sandbox_output_dir: Option<PathBuf>,
+    readonly_inputs: Vec<InspectBinding>,
+    executable_bind_paths: Vec<PathBuf>,
+    runtime_bind_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectBinding {
+    source: PathBuf,
+    target: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectHostSupport {
+    user_namespace: InspectSupportFlag,
+    mount_namespace: InspectSupportFlag,
+    pid_namespace: InspectSupportFlag,
+    network_namespace: InspectSupportFlag,
+    ipc_namespace: InspectSupportFlag,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectSupportFlag {
+    requested: bool,
+    available: bool,
+    reason: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Serialize)]
+struct DebugReport {
+    inspect: InspectReport,
+    result: Option<ExecutionResult>,
+    error: Option<CliErrorReport>,
+    exit_code: i32,
+}
+
 fn main() {
     let exit_code = match try_main() {
         Ok(code) => code,
@@ -176,13 +280,16 @@ fn try_main() -> std::result::Result<i32, CliErrorReport> {
     match cli.command {
         Commands::Run(args) => run_command(args),
         Commands::Validate(args) => validate_command(args),
+        Commands::Inspect(args) => inspect_command(args),
+        Commands::Debug(args) => debug_command(args),
     }
 }
 
 fn cli_error_format(cli: &Cli) -> ResultFormat {
     match &cli.command {
         Commands::Run(args) => args.result_format,
-        Commands::Validate(_) => ResultFormat::Pretty,
+        Commands::Inspect(args) => args.result_format,
+        Commands::Validate(_) | Commands::Debug(_) => ResultFormat::Pretty,
     }
 }
 
@@ -203,25 +310,14 @@ fn run_command(args: RunArgs) -> std::result::Result<i32, CliErrorReport> {
     let config = ExecutionConfig::load(&args.config)
         .with_context(|| format!("failed to load config from {}", args.config.display()))
         .map_err(|err| build_error_report("run", &err, args.result_format))?;
-    let result = run(
+    let result = execute_run(
         &config,
-        &RunOptions {
-            argv_override: if args.command.is_empty() {
-                None
-            } else {
-                Some(args.command)
-            },
-            artifact_dir: args.artifact_dir,
-            cgroup_root_override: None,
-        },
-    )
-    .with_context(|| {
-        format!(
-            "failed to execute sandbox run for {}",
-            args.config.display()
-        )
-    })
-    .map_err(|err| build_error_report("run", &err, args.result_format))?;
+        &args.config,
+        args.artifact_dir,
+        args.command,
+        "run",
+        args.result_format,
+    )?;
 
     match args.result_format {
         ResultFormat::Pretty => print_pretty_result(&result),
@@ -241,6 +337,404 @@ fn validate_command(args: ValidateArgs) -> std::result::Result<i32, CliErrorRepo
 
     print_validate_summary(&config, &args.config);
     Ok(0)
+}
+
+fn inspect_command(args: InspectArgs) -> std::result::Result<i32, CliErrorReport> {
+    let config = ExecutionConfig::load(&args.config)
+        .with_context(|| format!("failed to load config from {}", args.config.display()))
+        .map_err(|err| build_error_report("inspect", &err, args.result_format))?;
+    let report = build_inspect_report(
+        "inspect",
+        &args.config,
+        &config,
+        args.artifact_dir,
+        args.command,
+    );
+
+    match args.result_format {
+        ResultFormat::Pretty => println!("{}", render_pretty_inspect_report(&report)),
+        ResultFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .expect("serializing inspect report should succeed")
+        ),
+    }
+
+    Ok(0)
+}
+
+fn debug_command(args: DebugArgs) -> std::result::Result<i32, CliErrorReport> {
+    let config = ExecutionConfig::load(&args.config)
+        .with_context(|| format!("failed to load config from {}", args.config.display()))
+        .map_err(|err| build_error_report("debug", &err, ResultFormat::Pretty))?;
+    let inspect = build_inspect_report(
+        "debug",
+        &args.config,
+        &config,
+        args.artifact_dir.clone(),
+        args.command.clone(),
+    );
+    println!("{}", render_pretty_inspect_report(&inspect));
+    println!();
+
+    match execute_run(
+        &config,
+        &args.config,
+        args.artifact_dir,
+        args.command,
+        "debug",
+        ResultFormat::Pretty,
+    ) {
+        Ok(result) => {
+            let exit_code = result.status.process_exit_code();
+            println!("{}", render_pretty_result(&result));
+            println!();
+            println!("debug_exit_code: {exit_code}");
+            Ok(exit_code)
+        }
+        Err(error) => {
+            let exit_code = error.exit_code;
+            eprintln!("{}", render_pretty_error_report(&error));
+            eprintln!();
+            eprintln!("debug_exit_code: {exit_code}");
+            Ok(exit_code)
+        }
+    }
+}
+
+fn execute_run(
+    config: &ExecutionConfig,
+    config_path: &Path,
+    artifact_dir: Option<PathBuf>,
+    command: Vec<String>,
+    operation: &'static str,
+    error_format: ResultFormat,
+) -> std::result::Result<ExecutionResult, CliErrorReport> {
+    run(
+        config,
+        &RunOptions {
+            argv_override: command_override(command),
+            artifact_dir,
+            cgroup_root_override: None,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "failed to execute sandbox run for {}",
+            config_path.display()
+        )
+    })
+    .map_err(|err| build_error_report(operation, &err, error_format))
+}
+
+fn build_inspect_report(
+    operation: &'static str,
+    config_path: &Path,
+    config: &ExecutionConfig,
+    artifact_dir_override: Option<PathBuf>,
+    command: Vec<String>,
+) -> InspectReport {
+    let command_override_applied = !command.is_empty();
+    let artifact_dir_source = if artifact_dir_override.is_some() {
+        "cli_override"
+    } else if config.io.artifact_dir.is_some() {
+        "config"
+    } else {
+        "auto"
+    };
+    let run_options = RunOptions {
+        argv_override: command_override(command.clone()),
+        artifact_dir: artifact_dir_override,
+        cgroup_root_override: None,
+    };
+    let artifact_dir = planned_artifact_dir(config, &run_options);
+    let resolved_command = run_options
+        .argv_override
+        .clone()
+        .unwrap_or_else(|| config.process.argv.clone());
+    let stdout_path = resolve_cli_output_path(
+        &artifact_dir,
+        config.io.stdout_path.as_deref(),
+        "stdout.log",
+    );
+    let stderr_path = resolve_cli_output_path(
+        &artifact_dir,
+        config.io.stderr_path.as_deref(),
+        "stderr.log",
+    );
+    let stdout_within_artifact_dir = stdout_path.starts_with(&artifact_dir);
+    let stderr_within_artifact_dir = stderr_path.starts_with(&artifact_dir);
+    let namespace_support = probe_namespace_support();
+    let readonly_inputs = inspect_readonly_inputs(&config.filesystem.readonly_bind_paths);
+    let cgroup = inspect_cgroup(config, &artifact_dir);
+    let filesystem = inspect_filesystem(config, &artifact_dir, readonly_inputs);
+    let host_support = inspect_host_support(config, &namespace_support);
+    let mut warnings = Vec::new();
+
+    if !stdout_path.starts_with(&artifact_dir) {
+        warnings.push(format!(
+            "stdout path escapes artifact directory: {}",
+            stdout_path.display()
+        ));
+    }
+    if !stderr_path.starts_with(&artifact_dir) {
+        warnings.push(format!(
+            "stderr path escapes artifact directory: {}",
+            stderr_path.display()
+        ));
+    }
+    if cgroup.enabled && cgroup.root.is_none() {
+        warnings.push(
+            cgroup
+                .detail
+                .clone()
+                .unwrap_or_else(|| "cgroup v2 is required but unavailable".to_string()),
+        );
+    }
+    extend_namespace_warnings(config, &namespace_support, &mut warnings);
+    extend_readonly_collision_warnings(&filesystem.readonly_inputs, &mut warnings);
+
+    InspectReport {
+        operation,
+        config_path: config_path.to_path_buf(),
+        artifact_dir,
+        artifact_dir_source,
+        command: resolved_command,
+        command_override_applied,
+        stdout_path: stdout_path.clone(),
+        stderr_path: stderr_path.clone(),
+        stdout_within_artifact_dir,
+        stderr_within_artifact_dir,
+        process_cwd: config.process.cwd.clone(),
+        sandbox_cwd: rootfs_cwd(config),
+        cgroup,
+        filesystem,
+        host_support,
+        warnings,
+    }
+}
+
+fn inspect_cgroup(config: &ExecutionConfig, artifact_dir: &Path) -> InspectCgroup {
+    if !cgroup_limits_enabled(&config.resource_limits()) {
+        return InspectCgroup {
+            enabled: false,
+            root: None,
+            scope_name: None,
+            path: None,
+            detail: None,
+        };
+    }
+
+    let scope_name = cgroup_scope_name(artifact_dir);
+    match CgroupManager::probe_v2_root() {
+        Ok(manager) => {
+            let plan = CgroupPlan::new(scope_name.clone(), config.resource_limits());
+            InspectCgroup {
+                enabled: true,
+                root: Some(manager.root().to_path_buf()),
+                scope_name: Some(scope_name),
+                path: Some(plan.path_under(manager.root())),
+                detail: None,
+            }
+        }
+        Err(err) => InspectCgroup {
+            enabled: true,
+            root: None,
+            scope_name: Some(scope_name),
+            path: None,
+            detail: Some(err.to_string()),
+        },
+    }
+}
+
+fn inspect_filesystem(
+    config: &ExecutionConfig,
+    artifact_dir: &Path,
+    readonly_inputs: Vec<InspectBinding>,
+) -> InspectFilesystem {
+    let rootfs_enabled = config.filesystem.enable_rootfs;
+    let rootfs_dir = rootfs_enabled.then(|| {
+        config
+            .filesystem
+            .rootfs_dir
+            .clone()
+            .unwrap_or_else(|| artifact_dir.join("rootfs"))
+    });
+    let host_work_dir = rootfs_enabled.then(|| artifact_dir.join("work"));
+    let host_tmp_dir = rootfs_enabled.then(|| artifact_dir.join("tmp"));
+    let host_output_dir = rootfs_enabled
+        .then(|| {
+            config
+                .filesystem
+                .output_dir
+                .as_ref()
+                .map(|_| artifact_dir.join("outputs"))
+        })
+        .flatten();
+
+    InspectFilesystem {
+        rootfs_enabled,
+        rootfs_dir,
+        host_work_dir,
+        host_tmp_dir,
+        host_output_dir,
+        sandbox_work_dir: config.filesystem.work_dir.clone(),
+        sandbox_tmp_dir: config.filesystem.tmp_dir.clone(),
+        sandbox_output_dir: config.filesystem.output_dir.clone(),
+        readonly_inputs,
+        executable_bind_paths: config.filesystem.executable_bind_paths.clone(),
+        runtime_bind_paths: config.filesystem.runtime_bind_paths.clone(),
+    }
+}
+
+fn inspect_host_support(
+    config: &ExecutionConfig,
+    support: &NamespaceSupport,
+) -> InspectHostSupport {
+    InspectHostSupport {
+        user_namespace: inspect_support_flag(
+            config.filesystem.enter_user_namespace,
+            support.user_namespace,
+            support.user_reason.clone(),
+        ),
+        mount_namespace: inspect_support_flag(
+            config.filesystem.enter_mount_namespace,
+            support.mount_namespace,
+            support.mount_reason.clone(),
+        ),
+        pid_namespace: inspect_support_flag(
+            config.filesystem.enter_pid_namespace,
+            support.pid_namespace,
+            support.pid_reason.clone(),
+        ),
+        network_namespace: inspect_support_flag(
+            config.filesystem.enter_network_namespace,
+            support.network_namespace,
+            support.network_reason.clone(),
+        ),
+        ipc_namespace: inspect_support_flag(
+            config.filesystem.enter_ipc_namespace,
+            support.ipc_namespace,
+            support.ipc_reason.clone(),
+        ),
+    }
+}
+
+fn inspect_support_flag(
+    requested: bool,
+    available: bool,
+    reason: Option<String>,
+) -> InspectSupportFlag {
+    InspectSupportFlag {
+        requested,
+        available,
+        reason,
+    }
+}
+
+fn inspect_readonly_inputs(paths: &[PathBuf]) -> Vec<InspectBinding> {
+    paths
+        .iter()
+        .map(|source| InspectBinding {
+            source: source.clone(),
+            target: readonly_input_target(source),
+        })
+        .collect()
+}
+
+fn readonly_input_target(source: &Path) -> PathBuf {
+    let name = source
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("unknown"));
+    Path::new("/inputs").join(name)
+}
+
+fn extend_namespace_warnings(
+    config: &ExecutionConfig,
+    support: &NamespaceSupport,
+    warnings: &mut Vec<String>,
+) {
+    maybe_push_namespace_warning(
+        warnings,
+        "user namespace",
+        config.filesystem.enter_user_namespace,
+        support.user_namespace,
+        support.user_reason.as_deref(),
+    );
+    maybe_push_namespace_warning(
+        warnings,
+        "mount namespace",
+        config.filesystem.enter_mount_namespace,
+        support.mount_namespace,
+        support.mount_reason.as_deref(),
+    );
+    maybe_push_namespace_warning(
+        warnings,
+        "pid namespace",
+        config.filesystem.enter_pid_namespace,
+        support.pid_namespace,
+        support.pid_reason.as_deref(),
+    );
+    maybe_push_namespace_warning(
+        warnings,
+        "network namespace",
+        config.filesystem.enter_network_namespace,
+        support.network_namespace,
+        support.network_reason.as_deref(),
+    );
+    maybe_push_namespace_warning(
+        warnings,
+        "ipc namespace",
+        config.filesystem.enter_ipc_namespace,
+        support.ipc_namespace,
+        support.ipc_reason.as_deref(),
+    );
+}
+
+fn maybe_push_namespace_warning(
+    warnings: &mut Vec<String>,
+    label: &str,
+    requested: bool,
+    available: bool,
+    reason: Option<&str>,
+) {
+    if requested && !available {
+        let detail = reason.unwrap_or("unknown error");
+        warnings.push(format!("{label} is requested but unavailable: {detail}"));
+    }
+}
+
+fn extend_readonly_collision_warnings(bindings: &[InspectBinding], warnings: &mut Vec<String>) {
+    let mut counts = BTreeMap::new();
+    for binding in bindings {
+        *counts.entry(binding.target.clone()).or_insert(0usize) += 1;
+    }
+
+    for (target, count) in counts {
+        if count > 1 {
+            warnings.push(format!(
+                "multiple readonly inputs resolve to the same sandbox path: {}",
+                target.display()
+            ));
+        }
+    }
+}
+
+fn command_override(command: Vec<String>) -> Option<Vec<String>> {
+    if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    }
+}
+
+fn resolve_cli_output_path(base: &Path, configured: Option<&Path>, default_name: &str) -> PathBuf {
+    match configured {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => base.join(path),
+        None => base.join(default_name),
+    }
 }
 
 fn print_pretty_result(result: &ExecutionResult) {
@@ -437,6 +931,175 @@ fn render_pretty_result(result: &ExecutionResult) -> String {
     lines.join("\n")
 }
 
+fn render_pretty_inspect_report(report: &InspectReport) -> String {
+    let mut lines = vec![
+        format!("inspect: ok"),
+        format!("operation: {}", report.operation),
+        format!("config_path: {}", report.config_path.display()),
+        format!("artifact_dir: {}", report.artifact_dir.display()),
+        format!("artifact_dir_source: {}", report.artifact_dir_source),
+        format!("command: {:?}", report.command),
+        format!(
+            "command_override_applied: {}",
+            report.command_override_applied
+        ),
+        format!("stdout_path: {}", report.stdout_path.display()),
+        format!("stderr_path: {}", report.stderr_path.display()),
+        format!(
+            "stdout_within_artifact_dir: {}",
+            report.stdout_within_artifact_dir
+        ),
+        format!(
+            "stderr_within_artifact_dir: {}",
+            report.stderr_within_artifact_dir
+        ),
+        format!(
+            "process_cwd: {}",
+            report
+                .process_cwd
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "sandbox_cwd: {}",
+            report
+                .sandbox_cwd
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!("cgroup_enabled: {}", report.cgroup.enabled),
+        format!(
+            "cgroup_root: {}",
+            report
+                .cgroup
+                .root
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "cgroup_scope_name: {}",
+            report.cgroup.scope_name.as_deref().unwrap_or("n/a")
+        ),
+        format!(
+            "cgroup_path: {}",
+            report
+                .cgroup
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "cgroup_detail: {}",
+            report.cgroup.detail.as_deref().unwrap_or("n/a")
+        ),
+        format!("rootfs_enabled: {}", report.filesystem.rootfs_enabled),
+        format!(
+            "rootfs_dir: {}",
+            report
+                .filesystem
+                .rootfs_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "host_work_dir: {}",
+            report
+                .filesystem
+                .host_work_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "host_tmp_dir: {}",
+            report
+                .filesystem
+                .host_tmp_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "host_output_dir: {}",
+            report
+                .filesystem
+                .host_output_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "sandbox_work_dir: {}",
+            report.filesystem.sandbox_work_dir.display()
+        ),
+        format!(
+            "sandbox_tmp_dir: {}",
+            report.filesystem.sandbox_tmp_dir.display()
+        ),
+        format!(
+            "sandbox_output_dir: {}",
+            report
+                .filesystem
+                .sandbox_output_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "readonly_inputs: {}",
+            format_readonly_inputs(&report.filesystem.readonly_inputs)
+        ),
+        format!(
+            "namespace_user: {}",
+            format_support_flag(&report.host_support.user_namespace)
+        ),
+        format!(
+            "namespace_mount: {}",
+            format_support_flag(&report.host_support.mount_namespace)
+        ),
+        format!(
+            "namespace_pid: {}",
+            format_support_flag(&report.host_support.pid_namespace)
+        ),
+        format!(
+            "namespace_network: {}",
+            format_support_flag(&report.host_support.network_namespace)
+        ),
+        format!(
+            "namespace_ipc: {}",
+            format_support_flag(&report.host_support.ipc_namespace)
+        ),
+    ];
+
+    if report.warnings.is_empty() {
+        lines.push("warnings: none".to_string());
+    } else {
+        lines.push(format!("warnings: {}", report.warnings.join(" | ")));
+    }
+
+    lines.join("\n")
+}
+
+#[cfg(test)]
+fn render_pretty_debug_report(report: &DebugReport) -> String {
+    let mut sections = vec![render_pretty_inspect_report(&report.inspect)];
+
+    if let Some(result) = &report.result {
+        sections.push(render_pretty_result(result));
+    }
+    if let Some(error) = &report.error {
+        sections.push(render_pretty_error_report(error));
+    }
+
+    sections.push(format!("debug_exit_code: {}", report.exit_code));
+    sections.join("\n\n")
+}
+
 fn print_cli_error_report(report: &CliErrorReport) {
     match report.output_format {
         ResultFormat::Pretty => eprintln!("{}", render_pretty_error_report(report)),
@@ -463,6 +1126,44 @@ fn render_pretty_error_report(report: &CliErrorReport) -> String {
     }
 
     lines.join("\n")
+}
+
+fn format_readonly_inputs(bindings: &[InspectBinding]) -> String {
+    if bindings.is_empty() {
+        return "[]".to_string();
+    }
+
+    bindings
+        .iter()
+        .map(|binding| {
+            format!(
+                "{} -> {}",
+                binding.source.display(),
+                binding.target.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_support_flag(flag: &InspectSupportFlag) -> String {
+    if flag.available {
+        if flag.requested {
+            "requested+available".to_string()
+        } else {
+            "available".to_string()
+        }
+    } else if flag.requested {
+        format!(
+            "requested+unavailable ({})",
+            flag.reason.as_deref().unwrap_or("unknown error")
+        )
+    } else {
+        format!(
+            "unavailable ({})",
+            flag.reason.as_deref().unwrap_or("unknown error")
+        )
+    }
 }
 
 fn build_error_report(
@@ -542,12 +1243,13 @@ fn format_optional_i32(value: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
-        CliErrorCategory, ResultFormat, build_error_report, cgroup_limits_enabled,
-        format_optional_i32, format_optional_u64, print_validate_summary,
-        render_pretty_error_report, render_pretty_result, run_outcome_label, status_label,
+        CliErrorCategory, DebugReport, ResultFormat, build_error_report, build_inspect_report,
+        cgroup_limits_enabled, format_optional_i32, format_optional_u64, print_validate_summary,
+        render_pretty_debug_report, render_pretty_error_report, render_pretty_inspect_report,
+        render_pretty_result, run_outcome_label, status_label,
     };
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{
@@ -704,5 +1406,112 @@ mod tests {
         assert!(rendered.contains("outcome: payload_runtime_failure"));
         assert!(rendered.contains("summary: payload exited with non-zero status 42"));
         assert!(rendered.contains("suggestion: Inspect the payload stderr/stdout artifacts"));
+    }
+
+    #[test]
+    fn inspect_report_flags_duplicate_readonly_targets() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 4096
+
+                [filesystem]
+                readonly_bind_paths = ["/tmp/a/input.txt", "/tmp/b/input.txt"]
+            "#,
+        )
+        .expect("config should parse");
+
+        let report = build_inspect_report(
+            "inspect",
+            Path::new("configs/test.toml"),
+            &config,
+            Some(PathBuf::from("/tmp/inspect-artifacts")),
+            Vec::new(),
+        );
+
+        assert_eq!(report.filesystem.readonly_inputs.len(), 2);
+        assert!(
+            report
+                .filesystem
+                .readonly_inputs
+                .iter()
+                .all(|binding| { binding.target == PathBuf::from("/inputs/input.txt") })
+        );
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("multiple readonly inputs resolve to the same sandbox path")
+        }));
+    }
+
+    #[test]
+    fn pretty_inspect_report_includes_derived_paths() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+                memory_bytes = 4096
+
+                [filesystem]
+                output_dir = "/output"
+            "#,
+        )
+        .expect("config should parse");
+
+        let report = build_inspect_report(
+            "inspect",
+            Path::new("configs/test.toml"),
+            &config,
+            Some(PathBuf::from("/tmp/inspect-artifacts")),
+            vec!["/bin/echo".to_string(), "override".to_string()],
+        );
+        let rendered = render_pretty_inspect_report(&report);
+
+        assert!(rendered.contains("artifact_dir: /tmp/inspect-artifacts"));
+        assert!(rendered.contains("stdout_path: /tmp/inspect-artifacts/stdout.log"));
+        assert!(rendered.contains("host_output_dir: /tmp/inspect-artifacts/outputs"));
+        assert!(rendered.contains("command_override_applied: true"));
+    }
+
+    #[test]
+    fn pretty_debug_report_includes_error_section() {
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+
+                [limits]
+                wall_time_ms = 1000
+            "#,
+        )
+        .expect("config should parse");
+        let inspect = build_inspect_report(
+            "debug",
+            Path::new("configs/test.toml"),
+            &config,
+            Some(PathBuf::from("/tmp/debug-artifacts")),
+            Vec::new(),
+        );
+        let error = build_error_report(
+            "debug",
+            &anyhow::Error::new(SandboxError::Spawn("missing binary".into())),
+            ResultFormat::Pretty,
+        );
+
+        let rendered = render_pretty_debug_report(&DebugReport {
+            inspect,
+            result: None,
+            error: Some(error),
+            exit_code: 4,
+        });
+
+        assert!(rendered.contains("inspect: ok"));
+        assert!(rendered.contains("error: Sandbox payload could not be started"));
+        assert!(rendered.contains("debug_exit_code: 4"));
     }
 }

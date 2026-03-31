@@ -39,11 +39,7 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
         return Err(SandboxError::config("resolved command must not be empty"));
     }
 
-    let artifact_dir = options
-        .artifact_dir
-        .clone()
-        .or_else(|| config.io.artifact_dir.clone())
-        .unwrap_or_else(default_artifact_dir);
+    let artifact_dir = planned_artifact_dir(config, options);
     info!(
         target: "sandbox_audit",
         audit_stage = "run_start",
@@ -374,7 +370,7 @@ fn should_enable_cgroup(config: &ExecutionConfig) -> bool {
         || config.limits.max_processes.is_some()
 }
 
-fn cgroup_scope_name(artifact_dir: &Path) -> String {
+pub fn cgroup_scope_name(artifact_dir: &Path) -> String {
     artifact_dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -429,7 +425,7 @@ fn finalize_cgroup(
     }))
 }
 
-fn rootfs_cwd(config: &ExecutionConfig) -> Option<PathBuf> {
+pub fn rootfs_cwd(config: &ExecutionConfig) -> Option<PathBuf> {
     if !config.filesystem.chroot_to_rootfs {
         return config.process.cwd.clone();
     }
@@ -488,20 +484,20 @@ fn ensure_namespace_support(config: &ExecutionConfig) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Default)]
-struct NamespaceSupport {
-    user_namespace: bool,
-    user_reason: Option<String>,
-    mount_namespace: bool,
-    mount_reason: Option<String>,
-    pid_namespace: bool,
-    pid_reason: Option<String>,
-    network_namespace: bool,
-    network_reason: Option<String>,
-    ipc_namespace: bool,
-    ipc_reason: Option<String>,
+pub struct NamespaceSupport {
+    pub user_namespace: bool,
+    pub user_reason: Option<String>,
+    pub mount_namespace: bool,
+    pub mount_reason: Option<String>,
+    pub pid_namespace: bool,
+    pub pid_reason: Option<String>,
+    pub network_namespace: bool,
+    pub network_reason: Option<String>,
+    pub ipc_namespace: bool,
+    pub ipc_reason: Option<String>,
 }
 
-fn probe_namespace_support() -> NamespaceSupport {
+pub fn probe_namespace_support() -> NamespaceSupport {
     let user_probe = probe_user_namespace_support();
     let mount_probe = probe_unshare_support(libc::CLONE_NEWNS);
     let pid_probe = probe_unshare_support(libc::CLONE_NEWPID);
@@ -933,6 +929,14 @@ fn resolve_output_path(base: &Path, configured: Option<&Path>, default_name: &st
         Some(path) => base.join(path),
         None => base.join(default_name),
     }
+}
+
+pub fn planned_artifact_dir(config: &ExecutionConfig, options: &RunOptions) -> PathBuf {
+    options
+        .artifact_dir
+        .clone()
+        .or_else(|| config.io.artifact_dir.clone())
+        .unwrap_or_else(default_artifact_dir)
 }
 
 fn default_artifact_dir() -> PathBuf {

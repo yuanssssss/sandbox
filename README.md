@@ -50,6 +50,7 @@
   - 已加固异常清理路径：setup/spawn/wait 异常后会清理 cgroup，并终止已启动的 payload 进程组
   - CLI 已补用户可见错误报告：可区分配置问题、能力缺失、I/O/setup 失败与 payload 运行失败，并给出建议排查方向
   - 已补 `configs/minimal.toml` 与 `configs/strict.toml` 两套模板，分别覆盖“尽量易跑通”和“尽量强隔离”两类本地调试场景
+  - 已补 `inspect` / `debug` 调试命令，可直接查看派生的 artifact/rootfs/cgroup 路径、namespace 可用性与执行结果
 
 ## Workspace 结构
 
@@ -83,6 +84,25 @@ cargo run -p sandbox-cli -- validate --config configs/strict.toml
 cargo run -p sandbox-cli -- run --config configs/minimal.toml
 cargo run -p sandbox-cli -- run --config configs/strict.toml
 ```
+
+查看派生调试信息：
+
+```bash
+cargo run -p sandbox-cli -- inspect --config configs/minimal.toml
+cargo run -p sandbox-cli -- inspect --config configs/strict.toml
+```
+
+带调试上下文执行：
+
+```bash
+cargo run -p sandbox-cli -- debug --config configs/minimal.toml
+```
+
+其中：
+
+- `validate` 只检查配置并打印摘要
+- `inspect` 不执行 payload，只展示 artifact、rootfs、cgroup、readonly input 映射和 namespace 可用性
+- `debug` 会先打印 `inspect` 信息，再实际执行 payload，适合定位 mount/cgroup/setup 失败
 
 当前仓库提供两套模板：
 
