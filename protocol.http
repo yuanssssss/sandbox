@@ -552,6 +552,12 @@ GET {{baseUrl}}/api/v1/executions/exec-1
 Accept: application/json
 
 ###
+# 订阅异步任务事件流
+# 连接后会先回放当前 task 已有事件，再继续输出后续 accepted/running/completed/failed 事件
+GET {{baseUrl}}/api/v1/executions/exec-1/events
+Accept: text/event-stream
+
+###
 # 查询一个不存在的 task_id，预期返回 404 not_found
 GET {{baseUrl}}/api/v1/executions/exec-does-not-exist
 Accept: application/json

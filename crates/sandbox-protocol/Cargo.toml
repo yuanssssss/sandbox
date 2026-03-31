@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+async-stream.workspace = true
 axum.workspace = true
 sandbox-config = { path = "../sandbox-config" }
 sandbox-core = { path = "../sandbox-core" }

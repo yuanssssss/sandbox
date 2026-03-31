@@ -8,10 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use async_stream::stream;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, Query};
 use axum::http::StatusCode;
 use axum::http::header::{CONTENT_TYPE, HeaderValue};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -25,7 +27,7 @@ use sandbox_supervisor::{
     probe_namespace_support, run,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 
 pub type BackendFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -432,6 +434,26 @@ pub struct ExecutionTaskResponse {
     pub error: Option<ErrorDetail>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionTaskEvent {
+    pub sequence: u64,
+    pub task_id: String,
+    pub request_id: String,
+    pub status: ExecutionTaskStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    pub message: String,
+}
+
+impl ExecutionTaskEvent {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            ExecutionTaskStatus::Completed | ExecutionTaskStatus::Failed
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatus {
     pub status: String,
@@ -514,6 +536,14 @@ impl ProtocolError {
         }
     }
 }
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ProtocolError {}
 
 impl From<SandboxError> for ProtocolError {
     fn from(value: SandboxError) -> Self {
@@ -1528,6 +1558,30 @@ fn error_detail_from_protocol_error(
     }
 }
 
+fn execution_task_event_message(status: ExecutionTaskStatus) -> &'static str {
+    match status {
+        ExecutionTaskStatus::Accepted => "execution task accepted",
+        ExecutionTaskStatus::Running => "execution task running",
+        ExecutionTaskStatus::Completed => "execution task completed",
+        ExecutionTaskStatus::Failed => "execution task failed",
+    }
+}
+
+fn execution_task_sse_event(event: &ExecutionTaskEvent) -> Result<Event, ProtocolError> {
+    Event::default()
+        .event("task_status")
+        .id(event.sequence.to_string())
+        .json_data(event)
+        .map_err(|err| {
+            ProtocolError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("failed to serialize execution task event: {err}"),
+                Some(event.request_id.clone()),
+            )
+        })
+}
+
 struct ExecutionTaskManager<B> {
     backend: Arc<B>,
     next_task_id: AtomicU64,
@@ -1554,6 +1608,9 @@ impl Default for AsyncTaskRetentionPolicy {
 struct StoredExecutionTask {
     response: ExecutionTaskResponse,
     completed_at: Option<Instant>,
+    next_event_sequence: u64,
+    event_history: Vec<ExecutionTaskEvent>,
+    event_sender: broadcast::Sender<ExecutionTaskEvent>,
 }
 
 impl<B> ExecutionTaskManager<B>
@@ -1596,6 +1653,15 @@ where
             request_id: request_id.clone(),
             status: ExecutionTaskStatus::Accepted,
         };
+        let (event_sender, _) = broadcast::channel(16);
+        let accepted_event = ExecutionTaskEvent {
+            sequence: 0,
+            task_id: task_id.clone(),
+            request_id: request_id.clone(),
+            status: ExecutionTaskStatus::Accepted,
+            stage: Some("execution".to_string()),
+            message: "execution task accepted".to_string(),
+        };
 
         let mut tasks = self.tasks.write().await;
         prune_expired_tasks_locked(&mut tasks, self.retention, Instant::now());
@@ -1616,6 +1682,9 @@ where
                     error: None,
                 },
                 completed_at: None,
+                next_event_sequence: 1,
+                event_history: vec![accepted_event],
+                event_sender,
             },
         );
         drop(tasks);
@@ -1663,6 +1732,24 @@ where
             .map(|task| task.response.clone())
     }
 
+    async fn subscribe(
+        &self,
+        task_id: &str,
+    ) -> Result<
+        (
+            Vec<ExecutionTaskEvent>,
+            broadcast::Receiver<ExecutionTaskEvent>,
+        ),
+        ProtocolError,
+    > {
+        self.prune_expired_tasks().await;
+        let tasks = self.tasks.read().await;
+        let task = tasks
+            .get(task_id)
+            .ok_or_else(|| task_not_found_error(task_id))?;
+        Ok((task.event_history.clone(), task.event_sender.subscribe()))
+    }
+
     async fn prune_expired_tasks(&self) {
         prune_expired_tasks_with_policy(&self.tasks, self.retention).await;
     }
@@ -1704,6 +1791,17 @@ async fn update_task_status(
         task.response.status = status;
         task.response.report = report;
         task.response.error = error;
+        let event = ExecutionTaskEvent {
+            sequence: task.next_event_sequence,
+            task_id: task.response.task_id.clone(),
+            request_id: task.response.request_id.clone(),
+            status,
+            stage: Some("execution".to_string()),
+            message: execution_task_event_message(status).to_string(),
+        };
+        task.next_event_sequence += 1;
+        task.event_history.push(event.clone());
+        let _ = task.event_sender.send(event);
         task.completed_at = matches!(
             status,
             ExecutionTaskStatus::Completed | ExecutionTaskStatus::Failed
@@ -1749,6 +1847,7 @@ where
     let judge_job_file_store = Arc::clone(&judge_job_store);
     let async_submit_manager = Arc::new(ExecutionTaskManager::new(Arc::clone(&backend)));
     let async_status_manager = Arc::clone(&async_submit_manager);
+    let async_events_manager = Arc::clone(&async_submit_manager);
 
     Router::new()
         .route(
@@ -1855,6 +1954,43 @@ where
                     }
                 },
             ),
+        )
+        .route(
+            "/api/v1/executions/{task_id}/events",
+            get(move |AxumPath(task_id): AxumPath<String>| {
+                let manager = Arc::clone(&async_events_manager);
+                async move {
+                    let (history, mut receiver) = manager.subscribe(&task_id).await?;
+                    let stream = stream! {
+                        for event in history {
+                            let terminal = event.is_terminal();
+                            yield execution_task_sse_event(&event);
+                            if terminal {
+                                return;
+                            }
+                        }
+
+                        loop {
+                            match receiver.recv().await {
+                                Ok(event) => {
+                                    let terminal = event.is_terminal();
+                                    yield execution_task_sse_event(&event);
+                                    if terminal {
+                                        break;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    continue;
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    break;
+                                }
+                            }
+                        }
+                    };
+                    Ok::<_, ProtocolError>(Sse::new(stream).keep_alive(KeepAlive::default()))
+                }
+            }),
         )
         .route(
             "/api/v1/executions/{task_id}",
@@ -3145,6 +3281,18 @@ enable_rootfs = false
         .await
     }
 
+    async fn fetch_task_events_response(app: &Router, task_id: &str) -> Response {
+        send(
+            app,
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/v1/executions/{task_id}/events"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn async_execute_returns_accepted_and_completed_status() {
         let backend = GatedBackend::success();
@@ -3371,5 +3519,62 @@ enable_rootfs = false
             "execution task `missing-task` was not found"
         );
         assert_eq!(body.error.request_id, None);
+    }
+
+    #[tokio::test]
+    async fn async_events_stream_replays_status_transitions_until_completion() {
+        let backend = GatedBackend::success();
+        let app = build_router(backend.clone());
+        let payload = serde_json::to_vec(&ExecutionRequest {
+            request_id: "async-stream-001".to_string(),
+            config: sample_config(),
+            command_override: Some(vec!["/bin/echo".to_string(), "stream".to_string()]),
+            artifact_dir: Some("/tmp/sandbox-api/async-stream-001".into()),
+        })
+        .unwrap();
+
+        let response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/executions/async")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let accepted: ExecutionTaskAccepted = response_json(response).await;
+
+        backend.started.notified().await;
+
+        let events_response = fetch_task_events_response(&app, &accepted.task_id).await;
+        assert_eq!(events_response.status(), StatusCode::OK);
+
+        backend.gate.notify_waiters();
+
+        let bytes = to_bytes(events_response.into_body(), usize::MAX)
+            .await
+            .expect("sse body should be readable");
+        let body = String::from_utf8(bytes.to_vec()).expect("sse body should be utf-8");
+
+        assert!(body.contains("event: task_status"));
+        assert!(body.contains("\"status\":\"accepted\""));
+        assert!(body.contains("\"status\":\"running\""));
+        assert!(body.contains("\"status\":\"completed\""));
+    }
+
+    #[tokio::test]
+    async fn async_events_returns_not_found_for_unknown_task() {
+        let app = build_router(TestBackend);
+        let response = fetch_task_events_response(&app, "missing-task").await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: ErrorResponse = response_json(response).await;
+        assert_eq!(body.error.code, "not_found");
+        assert_eq!(
+            body.error.message,
+            "execution task `missing-task` was not found"
+        );
     }
 }

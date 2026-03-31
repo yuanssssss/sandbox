@@ -194,6 +194,7 @@ make docker-shell-prod
 - `POST /api/v1/executions`
 - `POST /api/v1/executions/async`
 - `GET /api/v1/executions/{task_id}`
+- `GET /api/v1/executions/{task_id}/events`
 - `POST /api/v1/judge-jobs`
 - `GET /api/v1/judge-jobs/{request_id}/artifacts`
 - `GET /api/v1/judge-jobs/{request_id}/artifacts/{stage}/file?path=...`
@@ -251,6 +252,18 @@ curl -sS http://127.0.0.1:3000/api/v1/executions/async \
 ```bash
 curl -sS http://127.0.0.1:3000/api/v1/executions/exec-1
 ```
+
+订阅异步任务事件流：
+
+```bash
+curl -N http://127.0.0.1:3000/api/v1/executions/exec-1/events
+```
+
+当前事件流行为：
+
+- 连接建立后会先回放这个 task 已有的状态事件
+- 然后继续推送后续 `accepted`、`running`、`completed`、`failed`
+- 终态事件发出后，流会结束
 
 judge job artifact 索引示例：
 
@@ -315,9 +328,9 @@ cargo run -p sandbox-cli -- run --config configs/minimal.toml --command /bin/ech
 
 优先继续做这些任务：
 
-1. 继续补编译阶段、checker 分层和 Unix domain socket 相关攻击样例
-2. 给内存中的异步任务和 artifact 注册表补 TTL、容量上限和清理策略
-3. 增加协议层流式状态输出，减少客户端轮询
+1. 给 `judge-jobs` 增加异步任务模型，统一多阶段任务和事件流
+2. 给内存中的 judge job artifact 注册表补 TTL、容量上限和清理策略
+3. 继续补更强的编译阶段隔离和高风险语言运行时样例
 
 ## 验证
 
