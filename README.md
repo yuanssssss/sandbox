@@ -59,6 +59,7 @@
   - 已补 `inspect` / `debug` 调试命令，可直接查看派生的 artifact/rootfs/cgroup 路径、namespace 可用性与执行结果
 - `M6` 安全验证：
   - 已在 `sandbox-testkit` 中补恶意样例与压力场景 catalog，见 `docs/malicious_sample_catalog.md`
+  - 已补 Unix domain socket / checker 混跑风险样例，验证共享输出目录暴露 UDS 会让 payload 窃取 checker sidecar 数据
   - 已补本地回归脚本 `scripts/run_regression_suite.sh` 与 GitHub Actions `regression.yml`
   - 已补压力脚本 `scripts/run_stress_suite.sh`、工作流 `stress.yml`，并生成基线报告 `docs/stress_test_report.md`
   - 已补上线前安全评审清单 `docs/security_review_checklist.md`，覆盖人工审查项、发布前命令检查与上线证据留档
@@ -103,6 +104,16 @@ cargo run -p sandbox-cli -- compile \
 ```bash
 cargo run -p sandbox-cli -- run --config configs/minimal.toml
 cargo run -p sandbox-cli -- run --config configs/strict.toml
+```
+
+提交多阶段 judge job 示例：
+
+```bash
+make -f examples/01/Makefile sandbox-judge-cpp-portable
+make -f examples/01/Makefile sandbox-judge-python-portable
+make -f examples/01/Makefile sandbox-judge-cpp
+make -f examples/01/Makefile sandbox-judge-python
+make -f examples/01/Makefile sandbox-judge-java
 ```
 
 查看派生调试信息：
@@ -166,6 +177,8 @@ make docker-shell-prod
 其中：
 
 - `compile` 用独立的编译结果模型返回 `source_dir`、`output_dir`、`outputs`，并区分 `compilation_failed` 与沙箱失败
+- `examples/01` 现在同时包含本地 CLI 样例和通过 `POST /api/v1/judge-jobs` 提交的多阶段 C++ / Java / Python 样例
+- `examples/01` 里的 portable judge job 模板不依赖 user namespace，适合先在宿主机走通完整链路；isolated 模板则演示真正的编译阶段隔离
 - `validate` 只检查配置并打印摘要
 - `inspect` 不执行 payload，只展示 artifact、rootfs、cgroup、readonly input 映射和 namespace 可用性
 - `debug` 会先打印 `inspect` 信息，再实际执行 payload，适合定位 mount/cgroup/setup 失败
@@ -248,6 +261,15 @@ curl -sS "http://127.0.0.1:3000/api/v1/judge-jobs/judge-pipeline-001/artifacts/c
 当前 artifact 索引保存在协议服务进程内存里，所以要先由同一个服务进程执行过对应的
 `request_id`，之后才能通过这些路由读取结果文件。
 
+如果你想直接复用多语言 judge job 模板，可以看：
+
+- [examples/01/README.md](/home/anyu/projects/sandbox/examples/01/README.md)
+- [cpp-isolated.json.in](/home/anyu/projects/sandbox/examples/01/judge-jobs/cpp-isolated.json.in)
+- [java-isolated.json.in](/home/anyu/projects/sandbox/examples/01/judge-jobs/java-isolated.json.in)
+- [python-isolated.json.in](/home/anyu/projects/sandbox/examples/01/judge-jobs/python-isolated.json.in)
+- [cpp-portable.json.in](/home/anyu/projects/sandbox/examples/01/judge-jobs/cpp-portable.json.in)
+- [python-portable.json.in](/home/anyu/projects/sandbox/examples/01/judge-jobs/python-portable.json.in)
+
 错误响应统一为：
 
 ```json
@@ -288,8 +310,8 @@ cargo run -p sandbox-cli -- run --config configs/minimal.toml --command /bin/ech
 优先继续做这些任务：
 
 1. 继续补编译阶段、checker 分层和 Unix domain socket 相关攻击样例
-2. 继续扩真实 cgroup v2 / namespace 特权环境下的压力基线
-3. 视威胁模型再补更细的 seccomp 与 LSM/微虚拟机路线
+2. 给内存中的异步任务和 artifact 注册表补 TTL、容量上限和清理策略
+3. 增加协议层流式状态输出，减少客户端轮询
 
 ## 验证
 

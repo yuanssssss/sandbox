@@ -1,0 +1,130 @@
+{
+  "request_id": "examples-01-cpp-judge",
+  "artifact_dir": "__REPO_ROOT__/.sandbox-runs/examples-01/judge-cpp",
+  "compile": {
+    "artifact_dir": "__REPO_ROOT__/.sandbox-runs/examples-01/judge-cpp/compile",
+    "config": {
+      "process": {
+        "argv": [
+          "/usr/bin/c++",
+          "-std=c++17",
+          "-O2",
+          "/inputs/main.cpp",
+          "-o",
+          "/output/main"
+        ],
+        "cwd": "/work",
+        "env": [
+          "LANG=C",
+          "PATH=/usr/bin:/bin"
+        ],
+        "clear_env": true
+      },
+      "limits": {
+        "wall_time_ms": 5000
+      },
+      "filesystem": {
+        "enable_rootfs": true,
+        "enter_user_namespace": true,
+        "enter_mount_namespace": true,
+        "enter_pid_namespace": true,
+        "apply_mounts": true,
+        "chroot_to_rootfs": true,
+        "work_dir": "/work",
+        "tmp_dir": "/tmp",
+        "output_dir": "/output",
+        "readonly_bind_paths": [
+          "__REPO_ROOT__/examples/01/languages/cpp/main.cpp"
+        ],
+        "executable_bind_paths": [
+          "/bin",
+          "/usr/bin",
+          "/etc/alternatives"
+        ]
+      }
+    }
+  },
+  "run": {
+    "artifact_dir": "__REPO_ROOT__/.sandbox-runs/examples-01/judge-cpp/run",
+    "inputs": {
+      "readonly_artifacts": [
+        {
+          "stage": "compile",
+          "artifact_path": "outputs/main"
+        }
+      ]
+    },
+    "config": {
+      "process": {
+        "argv": [
+          "/inputs/compile/outputs/main"
+        ],
+        "cwd": "/work",
+        "env": [
+          "LANG=C",
+          "PATH=/usr/bin:/bin"
+        ],
+        "clear_env": true
+      },
+      "limits": {
+        "wall_time_ms": 1000
+      },
+      "filesystem": {
+        "enable_rootfs": true,
+        "enter_user_namespace": true,
+        "enter_mount_namespace": true,
+        "enter_pid_namespace": true,
+        "apply_mounts": true,
+        "chroot_to_rootfs": true,
+        "work_dir": "/work",
+        "tmp_dir": "/tmp",
+        "executable_bind_paths": [
+          "/bin",
+          "/usr/bin",
+          "/etc/alternatives"
+        ]
+      }
+    }
+  },
+  "checker": {
+    "artifact_dir": "__REPO_ROOT__/.sandbox-runs/examples-01/judge-cpp/checker",
+    "inputs": {
+      "stdin": {
+        "stage": "run",
+        "artifact_path": "stdout.log"
+      }
+    },
+    "config": {
+      "process": {
+        "argv": [
+          "/bin/grep",
+          "^sum=7$"
+        ],
+        "cwd": "/work",
+        "env": [
+          "LANG=C",
+          "PATH=/usr/bin:/bin"
+        ],
+        "clear_env": true
+      },
+      "limits": {
+        "wall_time_ms": 1000
+      },
+      "filesystem": {
+        "enable_rootfs": true,
+        "enter_user_namespace": true,
+        "enter_mount_namespace": true,
+        "enter_pid_namespace": true,
+        "apply_mounts": true,
+        "chroot_to_rootfs": true,
+        "work_dir": "/work",
+        "tmp_dir": "/tmp",
+        "executable_bind_paths": [
+          "/bin",
+          "/usr/bin",
+          "/etc/alternatives"
+        ]
+      }
+    }
+  }
+}

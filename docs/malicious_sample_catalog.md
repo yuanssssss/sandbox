@@ -19,6 +19,9 @@
 - `default_ptrace_probe`
   - 目标：在默认 seccomp profile 下调用 `ptrace`
   - 预期防线：默认 profile 的 `ptrace` deny 规则
+- `checker_uds_probe`
+  - 目标：尝试连接错误暴露在共享输出目录中的 checker Unix domain socket
+  - 预期防线：checker 不应与用户程序在同一运行阶段混跑，也不应把 UDS 暴露到共享目录
 
 ## 使用位置
 
@@ -29,6 +32,5 @@
 ## 后续扩展方向
 
 - 输出洪泛 / 磁盘打满样例
-- Unix domain socket 与 checker 混跑风险样例
 - 编译阶段隔离样例
 - 更强的 `/proc` 与管理进程信息泄漏样例

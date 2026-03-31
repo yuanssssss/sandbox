@@ -7,7 +7,9 @@ REPO_ROOT := $(abspath $(EXAMPLE_DIR)/../..)
 EXAMPLE_REL_DIR := examples/01
 BUILD_DIR ?= $(EXAMPLE_DIR)/build
 CONFIG_DIR ?= $(EXAMPLE_REL_DIR)/configs
+JUDGE_JOB_DIR ?= $(EXAMPLE_REL_DIR)/judge-jobs
 SANDBOX ?= cd $(REPO_ROOT) && cargo run --manifest-path $(REPO_ROOT)/Cargo.toml -p sandbox-cli --
+API_BASE ?= http://127.0.0.1:3000
 
 BINARIES := \
 	$(BUILD_DIR)/hello \
@@ -17,7 +19,9 @@ BINARIES := \
 	$(BUILD_DIR)/danger_socket
 
 .PHONY: all clean help sandbox-validate sandbox-compile sandbox-run-hello sandbox-run-timeout \
-	sandbox-run-memory-limit sandbox-run-danger-ptrace sandbox-run-danger-socket
+	sandbox-run-memory-limit sandbox-run-danger-ptrace sandbox-run-danger-socket \
+	sandbox-judge-cpp sandbox-judge-java sandbox-judge-python \
+	sandbox-judge-cpp-portable sandbox-judge-python-portable
 
 all: $(BINARIES)
 
@@ -33,6 +37,11 @@ help:
 	@echo "make -f examples/01/Makefile sandbox-run-memory-limit"
 	@echo "make -f examples/01/Makefile sandbox-run-danger-ptrace"
 	@echo "make -f examples/01/Makefile sandbox-run-danger-socket"
+	@echo "make -f examples/01/Makefile sandbox-judge-cpp API_BASE=http://127.0.0.1:3000"
+	@echo "make -f examples/01/Makefile sandbox-judge-java API_BASE=http://127.0.0.1:3000"
+	@echo "make -f examples/01/Makefile sandbox-judge-python API_BASE=http://127.0.0.1:3000"
+	@echo "make -f examples/01/Makefile sandbox-judge-cpp-portable API_BASE=http://127.0.0.1:3000"
+	@echo "make -f examples/01/Makefile sandbox-judge-python-portable API_BASE=http://127.0.0.1:3000"
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -80,3 +89,23 @@ sandbox-run-danger-ptrace: all
 
 sandbox-run-danger-socket: all
 	$(SANDBOX) run --config $(CONFIG_DIR)/run-danger-socket.toml
+
+sandbox-judge-cpp:
+	sed "s|__REPO_ROOT__|$(REPO_ROOT)|g" $(JUDGE_JOB_DIR)/cpp-isolated.json.in | \
+		curl -sS $(API_BASE)/api/v1/judge-jobs -H 'content-type: application/json' --data-binary @-
+
+sandbox-judge-java:
+	sed "s|__REPO_ROOT__|$(REPO_ROOT)|g" $(JUDGE_JOB_DIR)/java-isolated.json.in | \
+		curl -sS $(API_BASE)/api/v1/judge-jobs -H 'content-type: application/json' --data-binary @-
+
+sandbox-judge-python:
+	sed "s|__REPO_ROOT__|$(REPO_ROOT)|g" $(JUDGE_JOB_DIR)/python-isolated.json.in | \
+		curl -sS $(API_BASE)/api/v1/judge-jobs -H 'content-type: application/json' --data-binary @-
+
+sandbox-judge-cpp-portable:
+	sed "s|__REPO_ROOT__|$(REPO_ROOT)|g" $(JUDGE_JOB_DIR)/cpp-portable.json.in | \
+		curl -sS $(API_BASE)/api/v1/judge-jobs -H 'content-type: application/json' --data-binary @-
+
+sandbox-judge-python-portable:
+	sed "s|__REPO_ROOT__|$(REPO_ROOT)|g" $(JUDGE_JOB_DIR)/python-portable.json.in | \
+		curl -sS $(API_BASE)/api/v1/judge-jobs -H 'content-type: application/json' --data-binary @-

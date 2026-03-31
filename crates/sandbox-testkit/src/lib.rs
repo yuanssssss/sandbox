@@ -46,6 +46,7 @@ pub enum MaliciousScenario {
     ReadonlyInputTamper,
     StrictSocketCreation,
     DefaultPtraceProbe,
+    CheckerUdsProbe,
 }
 
 impl MaliciousScenario {
@@ -56,6 +57,7 @@ impl MaliciousScenario {
             Self::ReadonlyInputTamper => "readonly_input_tamper",
             Self::StrictSocketCreation => "strict_socket_creation",
             Self::DefaultPtraceProbe => "default_ptrace_probe",
+            Self::CheckerUdsProbe => "checker_uds_probe",
         }
     }
 
@@ -66,6 +68,9 @@ impl MaliciousScenario {
             Self::ReadonlyInputTamper => "attempt to overwrite a readonly input file",
             Self::StrictSocketCreation => "attempt to create a network socket under strict seccomp",
             Self::DefaultPtraceProbe => "attempt to call ptrace under the default seccomp profile",
+            Self::CheckerUdsProbe => {
+                "attempt to connect to a checker unix domain socket exposed in the shared output directory"
+            }
         }
     }
 
@@ -76,6 +81,9 @@ impl MaliciousScenario {
             Self::ReadonlyInputTamper => "readonly bind mount policy",
             Self::StrictSocketCreation => "strict seccomp socket deny rule",
             Self::DefaultPtraceProbe => "default seccomp ptrace deny rule",
+            Self::CheckerUdsProbe => {
+                "checker must not run concurrently with the payload over a shared unix domain socket"
+            }
         }
     }
 
@@ -108,6 +116,12 @@ impl MaliciousScenario {
                 "import ctypes; libc = ctypes.CDLL(None, use_errno=True); result = libc.ptrace(0, 0, None, 0); err = ctypes.get_errno(); print(result); print(err); raise SystemExit(0 if result == -1 and err == 1 else 1)"
                     .to_string(),
             ],
+            Self::CheckerUdsProbe => vec![
+                "/usr/bin/python3".to_string(),
+                "-c".to_string(),
+                "import pathlib, socket, time\npath = '/output/checker.sock'\nmessage = 'no_socket'\nfor _ in range(100):\n    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n    try:\n        client.connect(path)\n        data = client.recv(1024)\n        message = data.decode('utf-8')\n        break\n    except OSError:\n        time.sleep(0.01)\n    finally:\n        client.close()\npathlib.Path('/output/result.txt').write_text(message)\nprint(message, end='')\n"
+                    .to_string(),
+            ],
         }
     }
 }
@@ -119,6 +133,7 @@ pub fn malicious_scenarios() -> &'static [MaliciousScenario] {
         MaliciousScenario::ReadonlyInputTamper,
         MaliciousScenario::StrictSocketCreation,
         MaliciousScenario::DefaultPtraceProbe,
+        MaliciousScenario::CheckerUdsProbe,
     ]
 }
 

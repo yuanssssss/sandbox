@@ -1354,6 +1354,8 @@ fn compilation_status_from_execution_status(status: &ExecutionStatus) -> Compila
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2371,6 +2373,76 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires mount namespace and chroot privileges in the test environment"]
+    fn mixed_checker_uds_exposes_secret_to_payload() {
+        let support = probe_namespace_support();
+        if !support.user_namespace || !support.mount_namespace || !support.pid_namespace {
+            return;
+        }
+
+        let artifact_dir = unique_artifact_dir("checker-uds-mixed");
+        let checker_secret = "checker-secret";
+        let socket_path = artifact_dir.join("outputs/checker.sock");
+        let server = spawn_checker_uds_server(socket_path.clone(), checker_secret);
+        let argv = format!("{:?}", MaliciousScenario::CheckerUdsProbe.argv());
+        let config = checker_uds_probe_config(&argv);
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir.clone()),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("malicious probe should run");
+
+        server.join().expect("checker uds server should join");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout, checker_secret);
+        assert_eq!(
+            fs::read_to_string(artifact_dir.join("outputs/result.txt"))
+                .expect("result file should exist"),
+            checker_secret
+        );
+    }
+
+    #[test]
+    #[ignore = "requires mount namespace and chroot privileges in the test environment"]
+    fn layered_checker_design_leaves_no_uds_to_probe() {
+        let support = probe_namespace_support();
+        if !support.user_namespace || !support.mount_namespace || !support.pid_namespace {
+            return;
+        }
+
+        let artifact_dir = unique_artifact_dir("checker-uds-layered");
+        let argv = format!("{:?}", MaliciousScenario::CheckerUdsProbe.argv());
+        let config = checker_uds_probe_config(&argv);
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir.clone()),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("malicious probe should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        let stdout = fs::read_to_string(result.stdout_path).expect("stdout should exist");
+        assert_eq!(stdout, "no_socket");
+        assert_eq!(
+            fs::read_to_string(artifact_dir.join("outputs/result.txt"))
+                .expect("result file should exist"),
+            "no_socket"
+        );
+        assert!(!artifact_dir.join("outputs/checker.sock").exists());
+    }
+
+    #[test]
     fn installs_default_seccomp_filter() {
         let config = ExecutionConfig::from_toml_str(
             r#"
@@ -3121,6 +3193,61 @@ mod tests {
             "#
         ))
         .expect("config should parse")
+    }
+
+    fn checker_uds_probe_config(argv: &str) -> ExecutionConfig {
+        ExecutionConfig::from_toml_str(&format!(
+            r#"
+                [process]
+                argv = {argv}
+
+                [limits]
+                wall_time_ms = 2000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_user_namespace = true
+                enter_mount_namespace = true
+                enter_pid_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                work_dir = "/work"
+                tmp_dir = "/tmp"
+                output_dir = "/output"
+                executable_bind_paths = ["/bin", "/usr/bin"]
+            "#
+        ))
+        .expect("config should parse")
+    }
+
+    fn spawn_checker_uds_server(
+        socket_path: PathBuf,
+        secret: &'static str,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let output_dir = socket_path.parent().expect("socket should have parent");
+            let start = Instant::now();
+            while !output_dir.exists() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "sandbox output directory did not appear in time"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            if socket_path.exists() {
+                fs::remove_file(&socket_path).expect("stale checker socket should be removable");
+            }
+            let listener = UnixListener::bind(&socket_path).expect("checker socket should bind");
+            let (mut stream, _) = listener
+                .accept()
+                .expect("payload should connect to checker socket");
+            stream
+                .write_all(secret.as_bytes())
+                .expect("checker secret should be written");
+            drop(stream);
+            drop(listener);
+            let _ = fs::remove_file(&socket_path);
+        })
     }
 
     fn unique_artifact_dir(prefix: &str) -> PathBuf {

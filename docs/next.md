@@ -20,8 +20,12 @@
   任一阶段失败都会短路后续阶段，并返回逐阶段报告
 - [x] 已完成第 4 项：protocol 已支持 judge job artifact 索引和文件读取接口，可通过
   HTTP 读取各阶段 `stdout`、`stderr` 和 `outputs/` 下的文件
-- [ ] 当前下一步：补 Unix domain socket 与 checker 混跑攻击样例
-- [ ] 后续再继续接编译阶段隔离样例、任务清理和异步流式状态
+- [x] 已完成第 5 项：已补 Unix domain socket 与 checker 混跑风险样例，并验证
+  错误混跑会暴露 secret、正确分层时只能得到 `no_socket`
+- [x] 已完成第 6 项：`examples/01` 已升级成多阶段评测 demo，补齐了 C++ / Java / Python
+  的 compile/run/checker 请求模板、Makefile target 和文档
+- [ ] 当前下一步：增加异步任务的保留期与清理机制
+- [ ] 后续再继续接协议层流式状态输出
 
 ## 推荐顺序
 
