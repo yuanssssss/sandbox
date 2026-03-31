@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -55,7 +55,7 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
     fs::create_dir_all(&artifact_dir)
         .map_err(|err| SandboxError::io("creating artifact directory", err))?;
 
-    if config.filesystem.enable_rootfs {
+    let rootfs_plan = if config.filesystem.enable_rootfs {
         let rootfs_plan = prepare_rootfs(&config.filesystem, &artifact_dir)?;
         info!(
             root = %rootfs_plan.layout.root.display(),
@@ -72,7 +72,10 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
             output_dir = ?rootfs_plan.layout.sandbox_output_dir,
             "sandbox audit"
         );
-    }
+        Some(rootfs_plan)
+    } else {
+        None
+    };
 
     ensure_namespace_support(&config)?;
 
@@ -99,6 +102,13 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
         let stderr = File::create(&stderr_path)
             .map_err(|err| SandboxError::io("opening stderr output file", err))?;
         let stdin = open_stdin(config.io.stdin_path.as_deref())?;
+        let preexec_log_path = artifact_dir.join("rootfs-preexec-error.log");
+        let preexec_log = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&preexec_log_path)
+            .map_err(|err| SandboxError::io("opening pre-exec diagnostics log", err))?;
 
         let mut process = Command::new(&command[0]);
         process.args(&command[1..]);
@@ -126,90 +136,145 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
             let rootfs_cwd = rootfs_cwd.clone();
             let outside_uid = libc::geteuid() as u32;
             let outside_gid = libc::getegid() as u32;
+            let command_for_preexec = command.clone();
+            let mut preexec_log = preexec_log;
+            let rootfs_plan = rootfs_plan.clone();
             process.pre_exec(move || {
+                log_preexec_stage(
+                    &mut preexec_log,
+                    "pre_exec_start",
+                    Some(format!(
+                        "euid={} egid={} outside_uid={} outside_gid={}",
+                        libc::geteuid(),
+                        libc::getegid(),
+                        outside_uid,
+                        outside_gid
+                    )),
+                );
+                log_preexec_stage(&mut preexec_log, "setsid", None);
                 if libc::setsid() == -1 {
+                    log_preexec_error(
+                        &mut preexec_log,
+                        "setsid",
+                        &std::io::Error::last_os_error().to_string(),
+                    );
                     return Err(std::io::Error::last_os_error());
                 }
                 if filesystem.enter_user_namespace {
+                    log_preexec_stage(&mut preexec_log, "enter_user_namespace", None);
                     enter_user_namespace(&filesystem, outside_uid, outside_gid).map_err(|err| {
-                        let _ = fs::write(
-                            artifact_dir.join("rootfs-preexec-error.log"),
-                            format!("enter_user_namespace failed: {err}"),
+                        log_preexec_error(
+                            &mut preexec_log,
+                            "enter_user_namespace",
+                            &err.to_string(),
                         );
                         err
                     })?;
                 }
                 if filesystem.enable_rootfs && filesystem.enter_mount_namespace {
+                    log_preexec_stage(&mut preexec_log, "enter_optional_namespaces", None);
                     enter_optional_namespaces(&filesystem).map_err(|err| {
-                        let _ = fs::write(
-                            artifact_dir.join("rootfs-preexec-error.log"),
-                            format!("enter_optional_namespaces failed: {err}"),
+                        log_preexec_error(
+                            &mut preexec_log,
+                            "enter_optional_namespaces",
+                            &err.to_string(),
                         );
                         err
                     })?;
-                    let plan = prepare_rootfs(&filesystem, &artifact_dir).map_err(|err| {
-                        let _ = fs::write(
-                            artifact_dir.join("rootfs-preexec-error.log"),
-                            err.to_string(),
+                    let plan = if let Some(plan) = rootfs_plan.as_ref() {
+                        plan
+                    } else {
+                        let err = std::io::Error::other(
+                            "rootfs enabled but prepared rootfs plan missing",
                         );
-                        std::io::Error::other(err)
-                    })?;
+                        log_preexec_error(
+                            &mut preexec_log,
+                            "reuse_prepared_rootfs",
+                            &err.to_string(),
+                        );
+                        return Err(err);
+                    };
+                    log_preexec_stage(
+                        &mut preexec_log,
+                        "reuse_prepared_rootfs",
+                        Some(format!(
+                            "root={} mount_count={}",
+                            plan.layout.root.display(),
+                            plan.mount_count()
+                        )),
+                    );
+                    log_preexec_stage(&mut preexec_log, "enter_mount_namespace", None);
                     enter_mount_namespace().map_err(|err| {
-                        let _ = fs::write(
-                            artifact_dir.join("rootfs-preexec-error.log"),
-                            err.to_string(),
+                        log_preexec_error(
+                            &mut preexec_log,
+                            "enter_mount_namespace",
+                            &err.to_string(),
                         );
                         std::io::Error::other(err)
                     })?;
                     if filesystem.apply_mounts {
+                        log_preexec_stage(&mut preexec_log, "apply_rootfs", None);
                         apply_rootfs(&plan, !filesystem.enter_pid_namespace).map_err(|err| {
-                            let _ = fs::write(
-                                artifact_dir.join("rootfs-preexec-error.log"),
-                                err.to_string(),
-                            );
+                            log_preexec_error(&mut preexec_log, "apply_rootfs", &err.to_string());
                             std::io::Error::other(err)
                         })?;
                     }
                     if filesystem.enter_pid_namespace {
+                        log_preexec_stage(&mut preexec_log, "enter_pid_namespace_for_exec", None);
                         enter_pid_namespace_for_exec(
                             filesystem.mount_proc.then_some(&plan),
                             &artifact_dir,
+                            &mut preexec_log,
                         )
                         .map_err(|err| {
-                            let _ = fs::write(
-                                artifact_dir.join("rootfs-preexec-error.log"),
-                                format!("enter_pid_namespace_for_exec failed: {err}"),
+                            log_preexec_error(
+                                &mut preexec_log,
+                                "enter_pid_namespace_for_exec",
+                                &err.to_string(),
                             );
                             err
                         })?;
                     }
                     if filesystem.chroot_to_rootfs {
+                        log_preexec_stage(
+                            &mut preexec_log,
+                            "chroot_into_rootfs",
+                            rootfs_cwd
+                                .as_ref()
+                                .map(|cwd| format!("cwd={}", cwd.display())),
+                        );
                         chroot_into_rootfs(&plan, rootfs_cwd.as_deref()).map_err(|err| {
-                            let _ = fs::write(
-                                artifact_dir.join("rootfs-preexec-error.log"),
-                                err.to_string(),
+                            log_preexec_error(
+                                &mut preexec_log,
+                                "chroot_into_rootfs",
+                                &err.to_string(),
                             );
                             std::io::Error::other(err)
                         })?;
                     }
                 }
                 if filesystem.enter_user_namespace && filesystem.drop_capabilities {
+                    log_preexec_stage(&mut preexec_log, "drop_capabilities", None);
                     drop_capabilities().map_err(|err| {
-                        let _ = fs::write(
-                            artifact_dir.join("rootfs-preexec-error.log"),
-                            format!("drop_capabilities failed: {err}"),
-                        );
+                        log_preexec_error(&mut preexec_log, "drop_capabilities", &err.to_string());
                         err
                     })?;
                 }
+                log_preexec_stage(
+                    &mut preexec_log,
+                    "install_seccomp",
+                    Some(format!("profile={:?}", security.seccomp_profile)),
+                );
                 install_seccomp(security.seccomp_profile).map_err(|err| {
                     let io_err = std::io::Error::other(err.to_string());
-                    let _ = fs::write(
-                        artifact_dir.join("rootfs-preexec-error.log"),
-                        format!("install_seccomp failed: {err}"),
-                    );
+                    log_preexec_error(&mut preexec_log, "install_seccomp", &err.to_string());
                     io_err
                 })?;
+                log_preexec_stage(
+                    &mut preexec_log,
+                    "ready_to_exec",
+                    Some(format!("command={:?}", command_for_preexec)),
+                );
                 Ok(())
             });
         }
@@ -225,15 +290,15 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
             artifact_dir = %artifact_dir.display(),
             "spawning sandbox payload"
         );
-        let preexec_log = artifact_dir.join("rootfs-preexec-error.log");
-        let _ = fs::remove_file(&preexec_log);
         let mut child = process.spawn().map_err(|err| {
-            let detail = fs::read_to_string(&preexec_log)
+            let detail = fs::read_to_string(&preexec_log_path)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
+                .map(|diagnostics| format!("{diagnostics}\nspawn error: {err}"))
                 .unwrap_or_else(|| err.to_string());
             SandboxError::Spawn(detail)
         })?;
+        let _ = fs::remove_file(&preexec_log_path);
         info!(
             target: "sandbox_audit",
             audit_stage = "payload_spawned",
@@ -628,7 +693,8 @@ fn probe_unshare_support(flag: libc::c_int) -> std::result::Result<(), String> {
 
 fn enter_pid_namespace_for_exec(
     proc_plan: Option<&RootfsPlan>,
-    artifact_dir: &Path,
+    _artifact_dir: &Path,
+    preexec_log: &mut File,
 ) -> std::io::Result<()> {
     let result = unsafe { libc::unshare(libc::CLONE_NEWPID) };
     if result == -1 {
@@ -642,11 +708,9 @@ fn enter_pid_namespace_for_exec(
 
     if pid == 0 {
         if let Some(plan) = proc_plan {
+            log_preexec_stage(preexec_log, "mount_proc_in_rootfs", None);
             mount_proc_in_rootfs(plan).map_err(|err| {
-                let _ = fs::write(
-                    artifact_dir.join("rootfs-preexec-error.log"),
-                    err.to_string(),
-                );
+                log_preexec_error(preexec_log, "mount_proc_in_rootfs", &err.to_string());
                 std::io::Error::other(err)
             })?;
         }
@@ -895,6 +959,26 @@ fn enter_single_namespace(flag: libc::c_int) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn log_preexec_stage(log: &mut File, stage: &str, detail: Option<String>) {
+    let mut message = format!("stage: {stage}");
+    if let Some(detail) = detail {
+        message.push_str(" | ");
+        message.push_str(&detail);
+    }
+    let _ = write_preexec_log_line(log, &message);
+}
+
+fn log_preexec_error(log: &mut File, stage: &str, detail: &str) {
+    let _ = write_preexec_log_line(log, &format!("error: {stage} | {detail}"));
+}
+
+fn write_preexec_log_line(log: &mut File, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    writeln!(log, "{line}")?;
+    log.flush()
 }
 
 fn writeln_stderr(message: &str) -> std::io::Result<()> {
@@ -1293,6 +1377,54 @@ mod tests {
         assert!(artifact_dir.join("rootfs/tmp").exists());
         assert!(artifact_dir.join("rootfs/proc").exists());
         assert!(artifact_dir.join("work").exists());
+    }
+
+    #[test]
+    #[ignore = "requires user and mount namespace support in the test environment"]
+    fn reuses_prepared_rootfs_plan_inside_pre_exec() {
+        let support = probe_namespace_support();
+        if !support.user_namespace || !support.mount_namespace {
+            return;
+        }
+
+        let artifact_dir = unique_artifact_dir("rootfs-reuse");
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/echo", "hello"]
+                cwd = "/work"
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = true
+                enter_user_namespace = true
+                enter_mount_namespace = true
+                apply_mounts = true
+                chroot_to_rootfs = true
+                mount_proc = false
+                work_dir = "/work"
+                tmp_dir = "/tmp"
+                executable_bind_paths = ["/bin", "/usr/bin"]
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = run(
+            &config,
+            &RunOptions {
+                argv_override: None,
+                artifact_dir: Some(artifact_dir.clone()),
+                cgroup_root_override: None,
+            },
+        )
+        .expect("command should run");
+
+        assert_eq!(result.status, ExecutionStatus::Ok);
+        assert_eq!(fs::read_to_string(result.stdout_path).unwrap(), "hello\n");
+        assert!(artifact_dir.join("rootfs").exists());
+        assert!(!artifact_dir.join("rootfs-preexec-error.log").exists());
     }
 
     #[test]
