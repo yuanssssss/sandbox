@@ -1,5 +1,6 @@
 /target
 /.sandbox-runs
+.env
 .golutra/
 .codex
 examples/*/build/

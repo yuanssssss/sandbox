@@ -1,0 +1,54 @@
+services:
+  sandbox:
+    build:
+      context: .
+      dockerfile: docker/prod.Dockerfile
+    image: ${SANDBOX_PROD_IMAGE}
+    container_name: ${SANDBOX_PROD_CONTAINER}
+    privileged: true
+    cgroup: host
+    env_file:
+      - .env
+    ports:
+      - "${SANDBOX_PORT}:3000"
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      - ./.sandbox-runs:/app/.sandbox-runs
+      - ./configs:/app/configs:ro
+      - ./examples:/app/examples:ro
+    restart: unless-stopped
+    command:
+      - serve
+      - --listen
+      - 0.0.0.0:3000
+      - --server-config
+      - /app/configs/protocol-server.toml
+      - --max-request-body-bytes
+      - "${SANDBOX_MAX_REQUEST_BODY_BYTES}"
+      - --max-concurrent-requests
+      - "${SANDBOX_MAX_CONCURRENT_REQUESTS}"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  sandbox-dev:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: docker/dev.Dockerfile
+    image: ${SANDBOX_DEV_IMAGE}
+    container_name: ${SANDBOX_DEV_CONTAINER}
+    privileged: true
+    cgroup: host
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      - .:/workspace
+    command: ["sleep", "infinity"]
