@@ -1,0 +1,172 @@
+@host = 127.0.0.1:3000
+@baseUrl = http://{{host}}
+@taskId = exec-1
+
+# 先启动协议服务：
+# cargo run -p sandbox-cli -- serve --listen 127.0.0.1:3000
+
+###
+# 健康检查
+GET {{baseUrl}}/healthz
+Accept: application/json
+
+###
+# 查看当前宿主机支持的 namespace / sandbox capability
+GET {{baseUrl}}/api/v1/capabilities
+Accept: application/json
+
+###
+# 校验一份最小可运行配置
+POST {{baseUrl}}/api/v1/config/validate
+Content-Type: application/json
+Accept: application/json
+
+{
+  "config": {
+    "process": {
+      "argv": ["/bin/echo", "hello from validate"],
+      "cwd": ".",
+      "env": ["LANG=C"],
+      "clear_env": true
+    },
+    "limits": {
+      "wall_time_ms": 1000
+    },
+    "filesystem": {
+      "enable_rootfs": false
+    }
+  }
+}
+
+###
+# 校验一份错误配置，预期返回 400 configuration
+POST {{baseUrl}}/api/v1/config/validate
+Content-Type: application/json
+Accept: application/json
+
+{
+  "config": {
+    "process": {
+      "argv": [],
+      "clear_env": true
+    },
+    "limits": {
+      "wall_time_ms": 0
+    },
+    "filesystem": {
+      "enable_rootfs": false
+    }
+  }
+}
+
+###
+# 同步执行：最小 echo 样例
+POST {{baseUrl}}/api/v1/executions
+Content-Type: application/json
+Accept: application/json
+
+{
+  "request_id": "sync-echo-001",
+  "artifact_dir": "/tmp/sandbox-protocol-http/sync-echo-001",
+  "config": {
+    "process": {
+      "argv": ["/bin/echo", "hello from protocol"],
+      "cwd": ".",
+      "env": ["LANG=C"],
+      "clear_env": true
+    },
+    "limits": {
+      "wall_time_ms": 1000
+    },
+    "filesystem": {
+      "enable_rootfs": false
+    }
+  }
+}
+
+###
+# 同步执行：使用 command_override 覆盖原始 argv
+POST {{baseUrl}}/api/v1/executions
+Content-Type: application/json
+Accept: application/json
+
+{
+  "request_id": "sync-override-001",
+  "artifact_dir": "/tmp/sandbox-protocol-http/sync-override-001",
+  "command_override": ["/bin/echo", "hello from override"],
+  "config": {
+    "process": {
+      "argv": ["/bin/echo", "this will be replaced"],
+      "cwd": ".",
+      "env": ["LANG=C"],
+      "clear_env": true
+    },
+    "limits": {
+      "wall_time_ms": 1000
+    },
+    "filesystem": {
+      "enable_rootfs": false
+    }
+  }
+}
+
+###
+# 异步执行：创建任务
+# 如果你的 HTTP client 支持脚本，这里会自动把 task_id 写入 {{taskId}}
+POST {{baseUrl}}/api/v1/executions/async
+Content-Type: application/json
+Accept: application/json
+
+{
+  "request_id": "async-echo-001",
+  "artifact_dir": "/tmp/sandbox-protocol-http/async-echo-001",
+  "config": {
+    "process": {
+      "argv": ["/bin/sh", "-c", "sleep 2; echo async done"],
+      "cwd": ".",
+      "env": ["LANG=C", "PATH=/usr/bin:/bin"],
+      "clear_env": true
+    },
+    "limits": {
+      "wall_time_ms": 5000
+    },
+    "filesystem": {
+      "enable_rootfs": false
+    }
+  }
+}
+
+> {%
+client.global.set("taskId", response.body.task_id);
+%}
+
+###
+# 查询异步任务状态
+# 可能看到 accepted / running / completed / failed
+GET {{baseUrl}}/api/v1/executions/{{taskId}}
+Accept: application/json
+
+###
+# 查询一个不存在的 task_id，预期返回 404 not_found
+GET {{baseUrl}}/api/v1/executions/exec-does-not-exist
+Accept: application/json
+
+###
+# 错误示例：不给 content-type，预期返回 415 invalid_content_type
+POST {{baseUrl}}/api/v1/executions
+Accept: application/json
+
+{
+  "request_id": "bad-content-type-001",
+  "config": {
+    "process": {
+      "argv": ["/bin/echo", "bad content type"]
+    },
+    "limits": {
+      "wall_time_ms": 1000
+    },
+    "filesystem": {
+      "enable_rootfs": false
+    }
+  }
+}

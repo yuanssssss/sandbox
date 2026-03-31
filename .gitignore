@@ -2,3 +2,4 @@
 /.sandbox-runs
 .golutra/
 .codex
+examples/*/build/
