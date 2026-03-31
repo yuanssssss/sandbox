@@ -1,5 +1,5 @@
 [process]
-argv = ["/usr/bin/make", "-f", "examples/01/Makefile", "all"]
+argv = ["/usr/bin/make", "-f", "examples/01/Makefile", "clean", "all"]
 cwd = "."
 env = ["LANG=C", "PATH=/usr/bin:/bin"]
 clear_env = true
@@ -17,5 +17,6 @@ seccomp_profile = "default"
 enable_rootfs = false
 
 # 这个编译配置优先保证示例简单可跑：
-# - 关闭 rootfs，让 `make` 可以直接把产物写回 `examples/01/build`
+# - 关闭 rootfs，让 `make` 可以直接在源码目录里重建 `examples/01/build`
 # - 仍然保留 supervisor、超时、审计日志和 seccomp 默认配置
+# - 编译产物目录由 `sandbox-cli compile --output-dir examples/01/build` 显式声明

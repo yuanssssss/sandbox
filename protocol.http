@@ -111,6 +111,111 @@ Accept: application/json
 }
 
 ###
+# 多阶段评测协议：run-only 兼容模式
+# 当前实现会把 top-level artifact_dir 映射到 run 阶段的 {{artifact_dir}}/run
+POST {{baseUrl}}/api/v1/judge-jobs
+Content-Type: application/json
+Accept: application/json
+
+{
+  "request_id": "judge-run-only-001",
+  "artifact_dir": "/tmp/sandbox-protocol-http/judge-run-only-001",
+  "run": {
+    "command_override": ["/bin/echo", "hello from judge job"],
+    "config": {
+      "process": {
+        "argv": ["/bin/echo", "this will be replaced"],
+        "cwd": ".",
+        "env": ["LANG=C"],
+        "clear_env": true
+      },
+      "limits": {
+        "wall_time_ms": 1000
+      },
+      "filesystem": {
+        "enable_rootfs": false
+      }
+    }
+  }
+}
+
+###
+# 多阶段评测协议：compile -> run -> checker JSON schema 示例
+# 当前阶段只完成了协议建模，真正的多阶段调度会返回 501 judge_job_not_implemented
+POST {{baseUrl}}/api/v1/judge-jobs
+Content-Type: application/json
+Accept: application/json
+
+{
+  "request_id": "judge-cpp-001",
+  "artifact_dir": "/tmp/sandbox-protocol-http/judge-cpp-001",
+  "compile": {
+    "config": {
+      "process": {
+        "argv": ["/usr/bin/cc", "main.c", "-O2", "-o", "/tmp/main"],
+        "cwd": ".",
+        "env": ["LANG=C"],
+        "clear_env": true
+      },
+      "limits": {
+        "wall_time_ms": 5000
+      },
+      "filesystem": {
+        "enable_rootfs": false
+      }
+    }
+  },
+  "run": {
+    "inputs": {
+      "readonly_artifacts": [
+        {
+          "stage": "compile",
+          "artifact_path": "outputs/main"
+        }
+      ]
+    },
+    "config": {
+      "process": {
+        "argv": ["/bin/echo", "simulate run stage"],
+        "cwd": ".",
+        "env": ["LANG=C"],
+        "clear_env": true
+      },
+      "limits": {
+        "wall_time_ms": 1000
+      },
+      "filesystem": {
+        "enable_rootfs": false
+      }
+    }
+  },
+  "checker": {
+    "inputs": {
+      "readonly_artifacts": [
+        {
+          "stage": "run",
+          "artifact_path": "stdout.log"
+        }
+      ]
+    },
+    "config": {
+      "process": {
+        "argv": ["/bin/echo", "simulate checker stage"],
+        "cwd": ".",
+        "env": ["LANG=C"],
+        "clear_env": true
+      },
+      "limits": {
+        "wall_time_ms": 1000
+      },
+      "filesystem": {
+        "enable_rootfs": false
+      }
+    }
+  }
+}
+
+###
 # 异步执行：创建任务
 # 如果你的 HTTP client 支持脚本，这里会自动把 task_id 写入 {{taskId}}
 POST {{baseUrl}}/api/v1/executions/async

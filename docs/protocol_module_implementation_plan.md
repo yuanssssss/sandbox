@@ -116,6 +116,82 @@
 }
 ```
 
+### `POST /api/v1/judge-jobs`
+
+用途：
+定义面向评测流水线的多阶段协议模型，显式表达 `compile`、`run`、`checker`
+三个阶段的输入、输出、状态和 artifact 边界。
+
+当前兼容策略：
+
+- 保留现有 `/api/v1/executions` 作为单次执行入口
+- 新增 `/api/v1/judge-jobs` 作为多阶段协议入口
+- 当前实现先支持 run-only judge job，便于平滑迁移已有调用方
+- 当请求显式包含 `compile` 或 `checker` 阶段时，当前后端返回 `501 judge_job_not_implemented`
+  明确表示协议已定义、执行编排将在下一阶段落地
+
+请求体建议：
+
+```json
+{
+  "request_id": "judge-run-001",
+  "artifact_dir": "/tmp/sandbox-api/judge-run-001",
+  "run": {
+    "command_override": ["/bin/echo", "hello from judge job"],
+    "config": { "...": "ExecutionConfig" }
+  }
+}
+```
+
+多阶段 schema 示例：
+
+```json
+{
+  "request_id": "judge-cpp-001",
+  "artifact_dir": "/tmp/sandbox-api/judge-cpp-001",
+  "compile": {
+    "config": { "...": "ExecutionConfig" }
+  },
+  "run": {
+    "inputs": {
+      "readonly_artifacts": [
+        { "stage": "compile", "artifact_path": "outputs/main" }
+      ]
+    },
+    "config": { "...": "ExecutionConfig" }
+  },
+  "checker": {
+    "inputs": {
+      "readonly_artifacts": [
+        { "stage": "run", "artifact_path": "stdout.log" }
+      ]
+    },
+    "config": { "...": "ExecutionConfig" }
+  }
+}
+```
+
+响应建议：
+
+```json
+{
+  "request": { "...": "JudgeJobRequest" },
+  "status": "completed",
+  "compile": null,
+  "run": {
+    "stage": "run",
+    "status": "completed",
+    "artifact_dir": "/tmp/sandbox-api/judge-run-001/run",
+    "result": { "...": "ExecutionResult" },
+    "artifacts": [
+      { "name": "stdout", "kind": "stdout", "path": "/tmp/.../stdout.log" },
+      { "name": "stderr", "kind": "stderr", "path": "/tmp/.../stderr.log" }
+    ]
+  },
+  "checker": null
+}
+```
+
 ## 5. 错误映射
 
 协议层需要把 `SandboxError` 映射成稳定的 HTTP 语义：
@@ -162,13 +238,14 @@
 
 ## 8. 下一阶段扩展
 
-MVP 完成后，建议按下面顺序继续扩展：
+MVP 与多阶段协议模型完成后，建议按下面顺序继续扩展：
 
-1. 增加异步任务模型：`POST /executions` 返回 `202 Accepted` 与任务 ID。
-2. 增加 `GET /api/v1/executions/:id` 查询运行状态。
-3. 增加审计日志流式输出或 SSE。
-4. 增加鉴权、中间件、请求大小限制和并发限制。
-5. 增加结果产物下载接口，例如 stdout/stderr 文件读取。
+1. 把 `compile` 从普通执行里独立出来，先真正执行编译阶段。
+2. 串起 `compile -> run -> checker` 阶段编排，并在阶段失败时停止后续阶段。
+3. 增加异步任务模型到 `judge-jobs`，返回 `202 Accepted` 与任务 ID。
+4. 增加阶段 artifact 索引与下载接口，例如 stdout/stderr/outputs 读取。
+5. 增加审计日志流式输出或 SSE。
+6. 增加鉴权、中间件、请求大小限制和并发限制。
 
 ## 9. 当前实现结论
 

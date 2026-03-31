@@ -64,7 +64,7 @@ sandbox-validate:
 	$(SANDBOX) validate --config $(CONFIG_DIR)/run-danger-socket.toml
 
 sandbox-compile:
-	$(SANDBOX) run --config $(CONFIG_DIR)/compile.toml
+	$(SANDBOX) compile --config $(CONFIG_DIR)/compile.toml --source-dir . --output-dir $(EXAMPLE_REL_DIR)/build
 
 sandbox-run-hello: all
 	$(SANDBOX) run --config $(CONFIG_DIR)/run-hello.toml

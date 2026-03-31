@@ -7,11 +7,13 @@ use anyhow::{Context, Error as AnyhowError, Result as AnyhowResult};
 use clap::{Parser, Subcommand, ValueEnum};
 use sandbox_cgroup::{CgroupManager, CgroupPlan};
 use sandbox_config::ExecutionConfig;
-use sandbox_core::{ExecutionResult, ExecutionStatus, SandboxError};
+use sandbox_core::{
+    CompilationResult, CompilationStatus, ExecutionResult, ExecutionStatus, SandboxError,
+};
 use sandbox_protocol::serve as serve_protocol;
 use sandbox_supervisor::{
-    NamespaceSupport, RunOptions, cgroup_scope_name, planned_artifact_dir, probe_namespace_support,
-    rootfs_cwd, run,
+    CompileOptions, NamespaceSupport, RunOptions, cgroup_scope_name, compile, planned_artifact_dir,
+    probe_namespace_support, rootfs_cwd, run,
 };
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
@@ -36,11 +38,28 @@ enum LogFormat {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    Compile(CompileArgs),
     Run(RunArgs),
     Validate(ValidateArgs),
     Inspect(InspectArgs),
     Debug(DebugArgs),
     Serve(ServeArgs),
+}
+
+#[derive(Debug, Parser)]
+struct CompileArgs {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    source_dir: Option<PathBuf>,
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+    #[arg(long)]
+    artifact_dir: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = ResultFormat::Pretty)]
+    result_format: ResultFormat,
+    #[arg(long, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -291,6 +310,7 @@ async fn try_main() -> std::result::Result<i32, CliErrorReport> {
     init_tracing(&cli).map_err(|err| build_error_report("startup", &err, error_format))?;
 
     match cli.command {
+        Commands::Compile(args) => compile_command(args),
         Commands::Run(args) => run_command(args),
         Commands::Validate(args) => validate_command(args),
         Commands::Inspect(args) => inspect_command(args),
@@ -301,6 +321,7 @@ async fn try_main() -> std::result::Result<i32, CliErrorReport> {
 
 fn cli_error_format(cli: &Cli) -> ResultFormat {
     match &cli.command {
+        Commands::Compile(args) => args.result_format,
         Commands::Run(args) => args.result_format,
         Commands::Inspect(args) => args.result_format,
         Commands::Validate(_) | Commands::Debug(_) | Commands::Serve(_) => ResultFormat::Pretty,
@@ -318,6 +339,33 @@ fn init_tracing(cli: &Cli) -> AnyhowResult<()> {
     }
 
     Ok(())
+}
+
+fn compile_command(args: CompileArgs) -> std::result::Result<i32, CliErrorReport> {
+    let config = ExecutionConfig::load(&args.config)
+        .with_context(|| format!("failed to load config from {}", args.config.display()))
+        .map_err(|err| build_error_report("compile", &err, args.result_format))?;
+    let result = execute_compile(
+        &config,
+        &args.config,
+        args.source_dir,
+        args.output_dir,
+        args.artifact_dir,
+        args.command,
+        "compile",
+        args.result_format,
+    )?;
+
+    match args.result_format {
+        ResultFormat::Pretty => print_pretty_compilation_result(&result),
+        ResultFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&result)
+                .expect("serializing compilation result should succeed")
+        ),
+    }
+
+    Ok(result.status.process_exit_code())
 }
 
 fn run_command(args: RunArgs) -> std::result::Result<i32, CliErrorReport> {
@@ -422,6 +470,35 @@ async fn serve_command(args: ServeArgs) -> std::result::Result<i32, CliErrorRepo
         .with_context(|| format!("failed to serve sandbox protocol on {}", args.listen))
         .map_err(|err| build_error_report("serve", &err, ResultFormat::Pretty))?;
     Ok(0)
+}
+
+fn execute_compile(
+    config: &ExecutionConfig,
+    config_path: &Path,
+    source_dir: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    artifact_dir: Option<PathBuf>,
+    command: Vec<String>,
+    operation: &'static str,
+    error_format: ResultFormat,
+) -> std::result::Result<CompilationResult, CliErrorReport> {
+    compile(
+        config,
+        &CompileOptions {
+            argv_override: command_override(command),
+            artifact_dir,
+            cgroup_root_override: None,
+            source_dir,
+            output_dir,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "failed to execute sandbox compile for {}",
+            config_path.display()
+        )
+    })
+    .map_err(|err| build_error_report(operation, &err, error_format))
 }
 
 fn execute_run(
@@ -763,6 +840,10 @@ fn print_pretty_result(result: &ExecutionResult) {
     println!("{}", render_pretty_result(result));
 }
 
+fn print_pretty_compilation_result(result: &CompilationResult) {
+    println!("{}", render_pretty_compilation_result(result));
+}
+
 fn print_validate_summary(config: &ExecutionConfig, config_path: &PathBuf) {
     let limits = config.resource_limits();
     let filesystem = &config.filesystem;
@@ -865,6 +946,18 @@ fn status_label(status: &ExecutionStatus) -> &'static str {
     }
 }
 
+fn compilation_status_label(status: &CompilationStatus) -> &'static str {
+    match status {
+        CompilationStatus::Ok => "ok",
+        CompilationStatus::CompilationFailed => "compilation_failed",
+        CompilationStatus::TimeLimitExceeded => "time_limit_exceeded",
+        CompilationStatus::WallTimeLimitExceeded => "wall_time_limit_exceeded",
+        CompilationStatus::MemoryLimitExceeded => "memory_limit_exceeded",
+        CompilationStatus::OutputLimitExceeded => "output_limit_exceeded",
+        CompilationStatus::SandboxError => "sandbox_error",
+    }
+}
+
 fn run_outcome_label(status: &ExecutionStatus) -> &'static str {
     match status {
         ExecutionStatus::Ok => "success",
@@ -874,6 +967,18 @@ fn run_outcome_label(status: &ExecutionStatus) -> &'static str {
         | ExecutionStatus::MemoryLimitExceeded
         | ExecutionStatus::OutputLimitExceeded => "sandbox_limit_enforced",
         ExecutionStatus::SandboxError => "sandbox_failure",
+    }
+}
+
+fn compile_outcome_label(status: &CompilationStatus) -> &'static str {
+    match status {
+        CompilationStatus::Ok => "success",
+        CompilationStatus::CompilationFailed => "compile_failure",
+        CompilationStatus::TimeLimitExceeded
+        | CompilationStatus::WallTimeLimitExceeded
+        | CompilationStatus::MemoryLimitExceeded
+        | CompilationStatus::OutputLimitExceeded => "sandbox_limit_enforced",
+        CompilationStatus::SandboxError => "sandbox_failure",
     }
 }
 
@@ -907,6 +1012,45 @@ fn run_summary(result: &ExecutionResult) -> String {
     }
 }
 
+fn compile_summary(result: &CompilationResult) -> String {
+    match result.status {
+        CompilationStatus::Ok => {
+            if result.outputs.is_empty() {
+                "compile command completed successfully".to_string()
+            } else {
+                format!(
+                    "compile command produced {} output file(s)",
+                    result.outputs.len()
+                )
+            }
+        }
+        CompilationStatus::CompilationFailed => {
+            if let Some(exit_code) = result.exit_code {
+                format!("compiler exited with non-zero status {exit_code}")
+            } else if let Some(signal) = result.term_signal {
+                format!("compiler terminated by signal {signal}")
+            } else {
+                "compiler exited with a failure".to_string()
+            }
+        }
+        CompilationStatus::TimeLimitExceeded => {
+            "compiler exceeded the configured CPU time limit".to_string()
+        }
+        CompilationStatus::WallTimeLimitExceeded => {
+            "compiler exceeded the configured wall-clock time limit".to_string()
+        }
+        CompilationStatus::MemoryLimitExceeded => {
+            "compiler exceeded the configured memory limit".to_string()
+        }
+        CompilationStatus::OutputLimitExceeded => {
+            "compiler exceeded the configured output limit".to_string()
+        }
+        CompilationStatus::SandboxError => {
+            "sandbox failed after the compiler had already started".to_string()
+        }
+    }
+}
+
 fn run_suggestion(status: &ExecutionStatus) -> Option<&'static str> {
     match status {
         ExecutionStatus::Ok => None,
@@ -920,6 +1064,24 @@ fn run_suggestion(status: &ExecutionStatus) -> Option<&'static str> {
             "Inspect the artifact logs and adjust the sandbox limits if this payload is expected to succeed.",
         ),
         ExecutionStatus::SandboxError => {
+            Some("Inspect stderr and audit logs to debug the sandbox itself.")
+        }
+    }
+}
+
+fn compile_suggestion(status: &CompilationStatus) -> Option<&'static str> {
+    match status {
+        CompilationStatus::Ok => None,
+        CompilationStatus::CompilationFailed => Some(
+            "Inspect the compiler stdout/stderr artifacts and the source/output directories to debug the build.",
+        ),
+        CompilationStatus::TimeLimitExceeded
+        | CompilationStatus::WallTimeLimitExceeded
+        | CompilationStatus::MemoryLimitExceeded
+        | CompilationStatus::OutputLimitExceeded => Some(
+            "Inspect the artifact logs and adjust the sandbox limits if this compile is expected to succeed.",
+        ),
+        CompilationStatus::SandboxError => {
             Some("Inspect stderr and audit logs to debug the sandbox itself.")
         }
     }
@@ -950,6 +1112,40 @@ fn render_pretty_result(result: &ExecutionResult) -> String {
     ];
 
     if let Some(suggestion) = run_suggestion(&result.status) {
+        lines.insert(3, format!("suggestion: {suggestion}"));
+    }
+
+    lines.join("\n")
+}
+
+fn render_pretty_compilation_result(result: &CompilationResult) -> String {
+    let mut lines = vec![
+        format!("status: {}", compilation_status_label(&result.status)),
+        format!("outcome: {}", compile_outcome_label(&result.status)),
+        format!("summary: {}", compile_summary(result)),
+        format!("command: {:?}", result.command),
+        format!("source_dir: {}", result.source_dir.display()),
+        format!("output_dir: {}", result.output_dir.display()),
+        format!("outputs: {}", format_output_paths(&result.outputs)),
+        format!("exit_code: {}", format_compilation_exit_code(result)),
+        format!(
+            "term_signal: {}",
+            format_result_term_signal(result.term_signal)
+        ),
+        format!("wall_time_ms: {}", result.usage.wall_time_ms),
+        format!(
+            "cpu_time_ms: {}",
+            format_result_measurement(result.usage.cpu_time_ms)
+        ),
+        format!(
+            "memory_peak_bytes: {}",
+            format_result_measurement(result.usage.memory_peak_bytes)
+        ),
+        format!("stdout: {}", result.stdout_path.display()),
+        format!("stderr: {}", result.stderr_path.display()),
+    ];
+
+    if let Some(suggestion) = compile_suggestion(&result.status) {
         lines.insert(3, format!("suggestion: {suggestion}"));
     }
 
@@ -1171,6 +1367,18 @@ fn format_readonly_inputs(bindings: &[InspectBinding]) -> String {
         .join(", ")
 }
 
+fn format_output_paths(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return "[]".to_string();
+    }
+
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn format_support_flag(flag: &InspectSupportFlag) -> String {
     if flag.available {
         if flag.requested {
@@ -1261,6 +1469,14 @@ fn format_result_exit_code(result: &ExecutionResult) -> String {
     }
 }
 
+fn format_compilation_exit_code(result: &CompilationResult) -> String {
+    match (result.exit_code, result.term_signal) {
+        (Some(code), _) => code.to_string(),
+        (None, Some(_)) => "none (terminated by signal)".to_string(),
+        (None, None) => "none".to_string(),
+    }
+}
+
 fn format_result_term_signal(value: Option<i32>) -> String {
     value
         .map(|current| current.to_string())
@@ -1293,14 +1509,16 @@ mod tests {
 
     use super::{
         CliErrorCategory, DebugReport, ResultFormat, build_error_report, build_inspect_report,
-        cgroup_limits_enabled, format_optional_i32, format_optional_u64, format_result_measurement,
-        format_result_term_signal, print_validate_summary, render_pretty_debug_report,
-        render_pretty_error_report, render_pretty_inspect_report, render_pretty_result,
-        run_outcome_label, status_label,
+        cgroup_limits_enabled, compilation_status_label, compile_outcome_label,
+        format_optional_i32, format_optional_u64, format_result_measurement,
+        format_result_term_signal, print_validate_summary, render_pretty_compilation_result,
+        render_pretty_debug_report, render_pretty_error_report, render_pretty_inspect_report,
+        render_pretty_result, run_outcome_label, status_label,
     };
     use sandbox_config::ExecutionConfig;
     use sandbox_core::{
-        ExecutionResult, ExecutionStatus, ResourceLimits, ResourceUsage, SandboxError,
+        CompilationResult, CompilationStatus, ExecutionResult, ExecutionStatus, ResourceLimits,
+        ResourceUsage, SandboxError,
     };
 
     #[test]
@@ -1315,6 +1533,10 @@ mod tests {
     fn exposes_human_readable_status_labels() {
         assert_eq!(status_label(&ExecutionStatus::Ok), "ok");
         assert_eq!(
+            compilation_status_label(&CompilationStatus::CompilationFailed),
+            "compilation_failed"
+        );
+        assert_eq!(
             status_label(&ExecutionStatus::MemoryLimitExceeded),
             "memory_limit_exceeded"
         );
@@ -1325,6 +1547,10 @@ mod tests {
         assert_eq!(
             run_outcome_label(&ExecutionStatus::RuntimeError),
             "payload_runtime_failure"
+        );
+        assert_eq!(
+            compile_outcome_label(&CompilationStatus::CompilationFailed),
+            "compile_failure"
         );
     }
 
@@ -1457,6 +1683,37 @@ mod tests {
         assert!(rendered.contains("suggestion: Inspect the payload stderr/stdout artifacts"));
         assert!(rendered.contains("term_signal: none"));
         assert!(rendered.contains("cpu_time_ms: not collected"));
+    }
+
+    #[test]
+    fn pretty_compilation_result_highlights_compile_failures() {
+        let rendered = render_pretty_compilation_result(&CompilationResult {
+            command: vec![
+                "/usr/bin/cc".to_string(),
+                "main.c".to_string(),
+                "-o".to_string(),
+                "build/main".to_string(),
+            ],
+            source_dir: PathBuf::from("/workspace/src"),
+            output_dir: PathBuf::from("/workspace/build"),
+            outputs: vec![PathBuf::from("/workspace/build/main")],
+            exit_code: Some(1),
+            term_signal: None,
+            usage: ResourceUsage {
+                cpu_time_ms: None,
+                wall_time_ms: 23,
+                memory_peak_bytes: None,
+            },
+            stdout_path: PathBuf::from("/tmp/compile.stdout"),
+            stderr_path: PathBuf::from("/tmp/compile.stderr"),
+            status: CompilationStatus::CompilationFailed,
+        });
+
+        assert!(rendered.contains("status: compilation_failed"));
+        assert!(rendered.contains("outcome: compile_failure"));
+        assert!(rendered.contains("summary: compiler exited with non-zero status 1"));
+        assert!(rendered.contains("outputs: /workspace/build/main"));
+        assert!(rendered.contains("suggestion: Inspect the compiler stdout/stderr artifacts"));
     }
 
     #[test]

@@ -13,10 +13,10 @@
 已完成能力：
 
 - Rust workspace 与 crate 边界
-- 统一错误类型与执行结果模型
+- 统一错误类型、运行结果模型与编译结果模型
 - TOML 配置解析与校验
 - `tracing` 日志初始化
-- CLI 入口：`run` / `validate` / `inspect` / `debug` / `serve`
+- CLI 入口：`compile` / `run` / `validate` / `inspect` / `debug` / `serve`
 - 最小 supervisor：
   - 启动子进程
   - 输出重定向到产物目录
@@ -89,6 +89,15 @@ cargo run -p sandbox-cli -- validate --config configs/minimal.toml
 cargo run -p sandbox-cli -- validate --config configs/strict.toml
 ```
 
+执行编译任务：
+
+```bash
+cargo run -p sandbox-cli -- compile \
+  --config examples/01/configs/compile.toml \
+  --source-dir . \
+  --output-dir examples/01/build
+```
+
 执行示例配置：
 
 ```bash
@@ -156,6 +165,7 @@ make docker-shell-prod
 
 其中：
 
+- `compile` 用独立的编译结果模型返回 `source_dir`、`output_dir`、`outputs`，并区分 `compilation_failed` 与沙箱失败
 - `validate` 只检查配置并打印摘要
 - `inspect` 不执行 payload，只展示 artifact、rootfs、cgroup、readonly input 映射和 namespace 可用性
 - `debug` 会先打印 `inspect` 信息，再实际执行 payload，适合定位 mount/cgroup/setup 失败

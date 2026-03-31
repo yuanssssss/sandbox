@@ -4,4 +4,6 @@ mod result;
 
 pub use error::{Result, SandboxError};
 pub use limits::ResourceLimits;
-pub use result::{ExecutionResult, ExecutionStatus, ResourceUsage};
+pub use result::{
+    CompilationResult, CompilationStatus, ExecutionResult, ExecutionStatus, ResourceUsage,
+};

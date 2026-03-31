@@ -7,7 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sandbox_cgroup::{CgroupManager, CgroupPlan};
 use sandbox_config::ExecutionConfig;
-use sandbox_core::{ExecutionResult, ExecutionStatus, ResourceUsage, Result, SandboxError};
+use sandbox_core::{
+    CompilationResult, CompilationStatus, ExecutionResult, ExecutionStatus, ResourceUsage, Result,
+    SandboxError,
+};
 use sandbox_mount::{
     RootfsPlan, apply_rootfs, chroot_into_rootfs, enter_mount_namespace, mount_proc_in_rootfs,
     prepare_rootfs,
@@ -20,6 +23,15 @@ pub struct RunOptions {
     pub argv_override: Option<Vec<String>>,
     pub artifact_dir: Option<PathBuf>,
     pub cgroup_root_override: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompileOptions {
+    pub argv_override: Option<Vec<String>>,
+    pub artifact_dir: Option<PathBuf>,
+    pub cgroup_root_override: Option<PathBuf>,
+    pub source_dir: Option<PathBuf>,
+    pub output_dir: Option<PathBuf>,
 }
 
 pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionResult> {
@@ -387,6 +399,57 @@ pub fn run(config: &ExecutionConfig, options: &RunOptions) -> Result<ExecutionRe
     result
 }
 
+pub fn compile(config: &ExecutionConfig, options: &CompileOptions) -> Result<CompilationResult> {
+    let run_options = RunOptions {
+        argv_override: options.argv_override.clone(),
+        artifact_dir: options.artifact_dir.clone(),
+        cgroup_root_override: options.cgroup_root_override.clone(),
+    };
+    let artifact_dir = planned_artifact_dir(config, &run_options);
+    let resolved = resolve_compile_paths(config, options, &artifact_dir)?;
+
+    fs::create_dir_all(&resolved.output_dir)
+        .map_err(|err| SandboxError::io("creating compilation output directory", err))?;
+
+    let mut compile_config = config.clone();
+    if let Some(source_dir) = options.source_dir.as_ref() {
+        if compile_config.filesystem.chroot_to_rootfs {
+            return Err(SandboxError::config(
+                "compile source_dir override is unsupported when filesystem.chroot_to_rootfs = true",
+            ));
+        }
+        compile_config.process.cwd = Some(source_dir.clone());
+    } else if compile_config.process.cwd.is_none() && !compile_config.filesystem.chroot_to_rootfs {
+        compile_config.process.cwd = Some(resolved.source_dir.clone());
+    }
+
+    let execution_result = run(&compile_config, &run_options)?;
+    let compilation_status = compilation_status_from_execution_status(&execution_result.status);
+    let outputs = collect_compile_outputs(&resolved.output_dir)?;
+    let ExecutionResult {
+        command,
+        exit_code,
+        term_signal,
+        usage,
+        stdout_path,
+        stderr_path,
+        status: _,
+    } = execution_result;
+
+    Ok(CompilationResult {
+        command,
+        source_dir: resolved.source_dir,
+        output_dir: resolved.output_dir,
+        outputs,
+        exit_code,
+        term_signal,
+        usage,
+        stdout_path,
+        stderr_path,
+        status: compilation_status,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct CgroupBinding {
     manager: CgroupManager,
@@ -398,6 +461,12 @@ struct FinalizedCgroup {
     usage: ResourceUsage,
     cpu_limit_exceeded: bool,
     memory_limit_exceeded: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCompilePaths {
+    source_dir: PathBuf,
+    output_dir: PathBuf,
 }
 
 fn prepare_cgroup_context(
@@ -1031,6 +1100,79 @@ fn default_artifact_dir() -> PathBuf {
     PathBuf::from(".sandbox-runs").join(format!("run-{millis}"))
 }
 
+fn resolve_compile_paths(
+    config: &ExecutionConfig,
+    options: &CompileOptions,
+    artifact_dir: &Path,
+) -> Result<ResolvedCompilePaths> {
+    let source_dir = options
+        .source_dir
+        .clone()
+        .or_else(|| config.process.cwd.clone())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let output_dir = if config.filesystem.enable_rootfs {
+        if options.output_dir.is_some() {
+            return Err(SandboxError::config(
+                "compile output_dir override is unsupported when filesystem.enable_rootfs = true; use filesystem.output_dir instead",
+            ));
+        }
+        if config.filesystem.output_dir.is_none() {
+            return Err(SandboxError::config(
+                "compile tasks with filesystem.enable_rootfs = true require filesystem.output_dir to be set",
+            ));
+        }
+        artifact_dir.join("outputs")
+    } else {
+        options
+            .output_dir
+            .clone()
+            .or_else(|| config.filesystem.output_dir.clone())
+            .ok_or_else(|| {
+                SandboxError::config(
+                    "compile tasks require an output directory via --output-dir or filesystem.output_dir",
+                )
+            })?
+    };
+
+    Ok(ResolvedCompilePaths {
+        source_dir,
+        output_dir,
+    })
+}
+
+fn collect_compile_outputs(output_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !output_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut outputs = Vec::new();
+    collect_compile_outputs_recursive(output_dir, &mut outputs)?;
+    outputs.sort();
+    Ok(outputs)
+}
+
+fn collect_compile_outputs_recursive(root: &Path, outputs: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(root)
+        .map_err(|err| SandboxError::io("reading compilation output directory", err))?
+    {
+        let entry = entry
+            .map_err(|err| SandboxError::io("reading compilation output directory entry", err))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|err| SandboxError::io("reading compilation output entry type", err))?;
+
+        if file_type.is_dir() {
+            collect_compile_outputs_recursive(&path, outputs)?;
+        } else if file_type.is_file() {
+            outputs.push(path);
+        }
+    }
+
+    Ok(())
+}
+
 fn assert_path_is_within(base: &Path, path: &Path) -> Result<()> {
     if !path.starts_with(base) {
         return Err(SandboxError::config(format!(
@@ -1197,6 +1339,18 @@ fn classify_status(
     }
 }
 
+fn compilation_status_from_execution_status(status: &ExecutionStatus) -> CompilationStatus {
+    match status {
+        ExecutionStatus::Ok => CompilationStatus::Ok,
+        ExecutionStatus::RuntimeError => CompilationStatus::CompilationFailed,
+        ExecutionStatus::TimeLimitExceeded => CompilationStatus::TimeLimitExceeded,
+        ExecutionStatus::WallTimeLimitExceeded => CompilationStatus::WallTimeLimitExceeded,
+        ExecutionStatus::MemoryLimitExceeded => CompilationStatus::MemoryLimitExceeded,
+        ExecutionStatus::OutputLimitExceeded => CompilationStatus::OutputLimitExceeded,
+        ExecutionStatus::SandboxError => CompilationStatus::SandboxError,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1207,12 +1361,15 @@ mod tests {
 
     use sandbox_cgroup::{CgroupManager, CgroupPlan};
     use sandbox_config::ExecutionConfig;
-    use sandbox_core::{ExecutionStatus, SandboxError};
+    use sandbox_core::{CompilationStatus, ExecutionStatus, SandboxError};
     use sandbox_testkit::{MaliciousScenario, ResourceScenario, Scenario, SeccompScenario};
     use tracing::dispatcher::Dispatch;
     use tracing_subscriber::fmt::MakeWriter;
 
-    use crate::{RunOptions, cgroup_scope_name, probe_namespace_support, rootfs_cwd, run};
+    use crate::{
+        CompileOptions, RunOptions, cgroup_scope_name, compile, probe_namespace_support,
+        rootfs_cwd, run,
+    };
 
     #[test]
     fn executes_simple_command() {
@@ -1268,6 +1425,85 @@ mod tests {
         .expect("command should run");
 
         assert_eq!(result.status, ExecutionStatus::WallTimeLimitExceeded);
+    }
+
+    #[test]
+    fn compile_collects_outputs_from_declared_output_dir() {
+        let source_dir = unique_artifact_dir("compile-source");
+        let output_dir = source_dir.join("build");
+        fs::create_dir_all(&source_dir).expect("source dir should exist");
+        fs::write(source_dir.join("input.txt"), "hello").expect("source file should exist");
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "cp input.txt build/result.txt"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = false
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = compile(
+            &config,
+            &CompileOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("compile-artifacts")),
+                cgroup_root_override: None,
+                source_dir: Some(source_dir.clone()),
+                output_dir: Some(output_dir.clone()),
+            },
+        )
+        .expect("compile command should run");
+
+        assert_eq!(result.status, CompilationStatus::Ok);
+        assert_eq!(result.source_dir, source_dir);
+        assert_eq!(result.output_dir, output_dir.clone());
+        assert_eq!(result.outputs, vec![output_dir.join("result.txt")]);
+        assert_eq!(
+            fs::read_to_string(output_dir.join("result.txt")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn compile_distinguishes_compile_failure_from_sandbox_failure() {
+        let source_dir = unique_artifact_dir("compile-failure-source");
+        let output_dir = source_dir.join("build");
+        fs::create_dir_all(&source_dir).expect("source dir should exist");
+
+        let config = ExecutionConfig::from_toml_str(
+            r#"
+                [process]
+                argv = ["/bin/sh", "-c", "exit 7"]
+
+                [limits]
+                wall_time_ms = 1000
+
+                [filesystem]
+                enable_rootfs = false
+            "#,
+        )
+        .expect("config should parse");
+
+        let result = compile(
+            &config,
+            &CompileOptions {
+                argv_override: None,
+                artifact_dir: Some(unique_artifact_dir("compile-failure-artifacts")),
+                cgroup_root_override: None,
+                source_dir: Some(source_dir),
+                output_dir: Some(output_dir),
+            },
+        )
+        .expect("compile command should run");
+
+        assert_eq!(result.status, CompilationStatus::CompilationFailed);
+        assert_eq!(result.exit_code, Some(7));
     }
 
     #[test]

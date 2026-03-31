@@ -10,6 +10,15 @@
 [malicious_sample_catalog.md](/home/anyu/projects/sandbox/docs/malicious_sample_catalog.md) 和当前实现状态，
 推荐优先推进下面这些事项。
 
+## 当前进度
+
+- [x] 已完成第 1 项：协议层已新增 `JudgeJobRequest` / `JudgeJobReport` 与 `/api/v1/judge-jobs`
+  路由，现有 `/api/v1/executions` 保持兼容
+- [x] 已完成第 2 项：supervisor / CLI 已新增独立 `compile` 执行模型，可区分
+  `compilation_failed` 与沙箱失败，并返回编译产物路径
+- [ ] 当前下一步：实现 checker 分层与阶段编排
+- [ ] 后续再继续接 artifact 下载和异步流式状态
+
 ## 推荐顺序
 
 1. 定义多阶段评测协议模型

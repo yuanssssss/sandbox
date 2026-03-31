@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use axum::extract::Path;
+use axum::extract::Path as AxumPath;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -31,6 +32,19 @@ pub trait ProtocolBackend: Send + Sync + 'static {
         &self,
         request: ExecutionRequest,
     ) -> BackendFuture<Result<ExecutionReport, ProtocolError>>;
+    fn execute_judge_job(
+        &self,
+        request: JudgeJobRequest,
+    ) -> BackendFuture<Result<JudgeJobReport, ProtocolError>> {
+        Box::pin(async move {
+            Err(ProtocolError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "judge_job_not_implemented",
+                "judge job execution is not implemented by this backend",
+                Some(request.request_id),
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,7 +54,7 @@ pub struct ExecutionRequest {
     #[serde(default)]
     pub command_override: Option<Vec<String>>,
     #[serde(default)]
-    pub artifact_dir: Option<std::path::PathBuf>,
+    pub artifact_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +68,270 @@ pub struct ExecutionReport {
     pub request: ExecutionRequest,
     pub result: ExecutionResult,
     pub audit_events: Vec<AuditEvent>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeStageName {
+    Compile,
+    Run,
+    Checker,
+}
+
+impl JudgeStageName {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Compile => "compile",
+            Self::Run => "run",
+            Self::Checker => "checker",
+        }
+    }
+
+    fn order(self) -> u8 {
+        match self {
+            Self::Compile => 0,
+            Self::Run => 1,
+            Self::Checker => 2,
+        }
+    }
+
+    fn precedes(self, other: Self) -> bool {
+        self.order() < other.order()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeArtifactKind {
+    Stdout,
+    Stderr,
+    OutputDirectory,
+    File,
+    Directory,
+    Log,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgeArtifactRef {
+    pub stage: JudgeStageName,
+    pub artifact_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct JudgeStageInputs {
+    #[serde(default)]
+    pub stdin: Option<JudgeArtifactRef>,
+    #[serde(default)]
+    pub readonly_artifacts: Vec<JudgeArtifactRef>,
+}
+
+impl JudgeStageInputs {
+    fn is_empty(&self) -> bool {
+        self.stdin.is_none() && self.readonly_artifacts.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeStageRequest {
+    pub config: ExecutionConfig,
+    #[serde(default)]
+    pub command_override: Option<Vec<String>>,
+    #[serde(default)]
+    pub artifact_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "JudgeStageInputs::is_empty")]
+    pub inputs: JudgeStageInputs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeJobRequest {
+    pub request_id: String,
+    #[serde(default)]
+    pub artifact_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub compile: Option<JudgeStageRequest>,
+    pub run: JudgeStageRequest,
+    #[serde(default)]
+    pub checker: Option<JudgeStageRequest>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeStageStatus {
+    Pending,
+    Completed,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeJobStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JudgeStageArtifact {
+    pub name: String,
+    pub kind: JudgeArtifactKind,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeStageReport {
+    pub stage: JudgeStageName,
+    pub request: JudgeStageRequest,
+    pub status: JudgeStageStatus,
+    #[serde(default)]
+    pub artifact_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<ExecutionResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<JudgeStageArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_events: Vec<AuditEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorDetail>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeJobReport {
+    pub request: JudgeJobRequest,
+    pub status: JudgeJobStatus,
+    #[serde(default)]
+    pub compile: Option<JudgeStageReport>,
+    pub run: JudgeStageReport,
+    #[serde(default)]
+    pub checker: Option<JudgeStageReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audit_events: Vec<AuditEvent>,
+}
+
+impl JudgeJobRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.request_id.trim().is_empty() {
+            return Err(invalid_judge_job_request(
+                &self.request_id,
+                "request_id must not be empty",
+            ));
+        }
+
+        if let Some(request) = self.compile.as_ref() {
+            self.validate_stage_request(JudgeStageName::Compile, request)?;
+        }
+        self.validate_stage_request(JudgeStageName::Run, &self.run)?;
+        if let Some(request) = self.checker.as_ref() {
+            self.validate_stage_request(JudgeStageName::Checker, request)?;
+        }
+
+        Ok(())
+    }
+
+    fn stage_request(&self, stage: JudgeStageName) -> Option<&JudgeStageRequest> {
+        match stage {
+            JudgeStageName::Compile => self.compile.as_ref(),
+            JudgeStageName::Run => Some(&self.run),
+            JudgeStageName::Checker => self.checker.as_ref(),
+        }
+    }
+
+    fn stage_defined(&self, stage: JudgeStageName) -> bool {
+        self.stage_request(stage).is_some()
+    }
+
+    fn stage_artifact_dir(&self, stage: JudgeStageName) -> Option<PathBuf> {
+        self.stage_request(stage)
+            .and_then(|request| request.artifact_dir.clone())
+            .or_else(|| {
+                self.artifact_dir
+                    .as_ref()
+                    .map(|root| root.join(stage.as_str()))
+            })
+    }
+
+    fn validate_stage_request(
+        &self,
+        stage: JudgeStageName,
+        request: &JudgeStageRequest,
+    ) -> Result<(), ProtocolError> {
+        request.config.validate().map_err(|err| {
+            let mut mapped = ProtocolError::from(err);
+            mapped.request_id = Some(self.request_id.clone());
+            mapped.message = format!("judge stage `{}`: {}", stage.as_str(), mapped.message);
+            mapped
+        })?;
+
+        if let Some(command) = request.command_override.as_ref() {
+            if command.is_empty() {
+                return Err(invalid_judge_job_request(
+                    &self.request_id,
+                    format!(
+                        "judge stage `{}` command_override must not be empty",
+                        stage.as_str()
+                    ),
+                ));
+            }
+        }
+
+        self.validate_stage_inputs(stage, &request.inputs)
+    }
+
+    fn validate_stage_inputs(
+        &self,
+        stage: JudgeStageName,
+        inputs: &JudgeStageInputs,
+    ) -> Result<(), ProtocolError> {
+        if let Some(stdin) = inputs.stdin.as_ref() {
+            self.validate_artifact_ref(stage, stdin)?;
+        }
+        for artifact in &inputs.readonly_artifacts {
+            self.validate_artifact_ref(stage, artifact)?;
+        }
+        Ok(())
+    }
+
+    fn validate_artifact_ref(
+        &self,
+        current_stage: JudgeStageName,
+        reference: &JudgeArtifactRef,
+    ) -> Result<(), ProtocolError> {
+        if !reference.stage.precedes(current_stage) {
+            return Err(invalid_judge_job_request(
+                &self.request_id,
+                format!(
+                    "judge stage `{}` can only reference artifacts from earlier stages",
+                    current_stage.as_str()
+                ),
+            ));
+        }
+
+        if !self.stage_defined(reference.stage) {
+            return Err(invalid_judge_job_request(
+                &self.request_id,
+                format!(
+                    "judge stage `{}` references missing `{}` artifacts",
+                    current_stage.as_str(),
+                    reference.stage.as_str()
+                ),
+            ));
+        }
+
+        validate_relative_artifact_path(&self.request_id, current_stage, &reference.artifact_path)
+    }
+
+    fn into_run_only_execution_request(&self) -> Result<ExecutionRequest, ProtocolError> {
+        if self.compile.is_some() || self.checker.is_some() {
+            return Err(judge_job_pipeline_not_implemented_error(&self.request_id));
+        }
+
+        Ok(ExecutionRequest {
+            request_id: self.request_id.clone(),
+            config: self.run.config.clone(),
+            command_override: self.run.command_override.clone(),
+            artifact_dir: self.stage_artifact_dir(JudgeStageName::Run),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +537,50 @@ fn not_found_error() -> ProtocolError {
     ProtocolError::new(StatusCode::NOT_FOUND, "not_found", "route not found", None)
 }
 
+fn invalid_judge_job_request(request_id: &str, message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        message,
+        Some(request_id.to_string()),
+    )
+}
+
+fn validate_relative_artifact_path(
+    request_id: &str,
+    stage: JudgeStageName,
+    artifact_path: &Path,
+) -> Result<(), ProtocolError> {
+    if artifact_path.as_os_str().is_empty() {
+        return Err(invalid_judge_job_request(
+            request_id,
+            format!(
+                "judge stage `{}` artifact_path must not be empty",
+                stage.as_str()
+            ),
+        ));
+    }
+
+    if artifact_path.is_absolute()
+        || artifact_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(invalid_judge_job_request(
+            request_id,
+            format!(
+                "judge stage `{}` artifact_path must stay within the referenced stage artifact root",
+                stage.as_str()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 fn method_not_allowed_error() -> ProtocolError {
     ProtocolError::new(
         StatusCode::METHOD_NOT_ALLOWED,
@@ -275,6 +597,93 @@ fn task_not_found_error(task_id: &str) -> ProtocolError {
         format!("execution task `{task_id}` was not found"),
         None,
     )
+}
+
+fn judge_job_pipeline_not_implemented_error(request_id: &str) -> ProtocolError {
+    ProtocolError::new(
+        StatusCode::NOT_IMPLEMENTED,
+        "judge_job_not_implemented",
+        "multi-stage judge jobs with `compile` or `checker` are not implemented yet",
+        Some(request_id.to_string()),
+    )
+}
+
+fn judge_job_status_from_execution_status(
+    status: &sandbox_core::ExecutionStatus,
+) -> JudgeJobStatus {
+    match status {
+        sandbox_core::ExecutionStatus::Ok => JudgeJobStatus::Completed,
+        _ => JudgeJobStatus::Failed,
+    }
+}
+
+fn build_judge_stage_artifacts(
+    artifact_dir: Option<&Path>,
+    stage_request: &JudgeStageRequest,
+    result: &ExecutionResult,
+) -> Vec<JudgeStageArtifact> {
+    let mut artifacts = vec![
+        JudgeStageArtifact {
+            name: "stdout".to_string(),
+            kind: JudgeArtifactKind::Stdout,
+            path: result.stdout_path.clone(),
+        },
+        JudgeStageArtifact {
+            name: "stderr".to_string(),
+            kind: JudgeArtifactKind::Stderr,
+            path: result.stderr_path.clone(),
+        },
+    ];
+
+    if let (Some(artifact_dir), Some(_)) = (
+        artifact_dir,
+        stage_request.config.filesystem.output_dir.as_ref(),
+    ) {
+        artifacts.push(JudgeStageArtifact {
+            name: "outputs".to_string(),
+            kind: JudgeArtifactKind::OutputDirectory,
+            path: artifact_dir.join("outputs"),
+        });
+    }
+
+    artifacts
+}
+
+fn build_run_only_judge_job_report(
+    request: JudgeJobRequest,
+    execution_report: ExecutionReport,
+) -> JudgeJobReport {
+    let stage_artifact_dir = execution_report
+        .request
+        .artifact_dir
+        .clone()
+        .or_else(|| request.stage_artifact_dir(JudgeStageName::Run));
+    let run_request = request.run.clone();
+    let stage_artifacts = build_judge_stage_artifacts(
+        stage_artifact_dir.as_deref(),
+        &run_request,
+        &execution_report.result,
+    );
+    let stage_audit_events = execution_report.audit_events.clone();
+    let status = judge_job_status_from_execution_status(&execution_report.result.status);
+
+    JudgeJobReport {
+        request,
+        status,
+        compile: None,
+        run: JudgeStageReport {
+            stage: JudgeStageName::Run,
+            request: run_request,
+            status: JudgeStageStatus::Completed,
+            artifact_dir: stage_artifact_dir,
+            result: Some(execution_report.result),
+            artifacts: stage_artifacts,
+            audit_events: stage_audit_events,
+            error: None,
+        },
+        checker: None,
+        audit_events: execution_report.audit_events,
+    }
 }
 
 fn error_detail_from_protocol_error(
@@ -402,6 +811,7 @@ where
     let capabilities_backend = Arc::clone(&backend);
     let validate_backend = Arc::clone(&backend);
     let execute_backend = Arc::clone(&backend);
+    let judge_job_backend = Arc::clone(&backend);
     let async_submit_manager = Arc::new(ExecutionTaskManager::new(Arc::clone(&backend)));
     let async_status_manager = Arc::clone(&async_submit_manager);
 
@@ -445,6 +855,18 @@ where
             ),
         )
         .route(
+            "/api/v1/judge-jobs",
+            post(
+                move |payload: Result<Json<JudgeJobRequest>, JsonRejection>| {
+                    let backend = Arc::clone(&judge_job_backend);
+                    async move {
+                        let Json(request) = payload.map_err(json_rejection_to_protocol_error)?;
+                        backend.execute_judge_job(request).await.map(Json)
+                    }
+                },
+            ),
+        )
+        .route(
             "/api/v1/executions/async",
             post(
                 move |payload: Result<Json<ExecutionRequest>, JsonRejection>| {
@@ -461,7 +883,7 @@ where
         )
         .route(
             "/api/v1/executions/{task_id}",
-            get(move |Path(task_id): Path<String>| {
+            get(move |AxumPath(task_id): AxumPath<String>| {
                 let manager = Arc::clone(&async_status_manager);
                 async move {
                     manager
@@ -563,6 +985,19 @@ impl ProtocolBackend for SupervisorBackend {
                     },
                 ],
             })
+        })
+    }
+
+    fn execute_judge_job(
+        &self,
+        request: JudgeJobRequest,
+    ) -> BackendFuture<Result<JudgeJobReport, ProtocolError>> {
+        let backend = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let execution_request = request.into_run_only_execution_request()?;
+            let execution_report = backend.execute(execution_request).await?;
+            Ok(build_run_only_judge_job_report(request, execution_report))
         })
     }
 }
@@ -691,6 +1126,19 @@ mod tests {
                 })
             })
         }
+
+        fn execute_judge_job(
+            &self,
+            request: JudgeJobRequest,
+        ) -> BackendFuture<Result<JudgeJobReport, ProtocolError>> {
+            let backend = self.clone();
+            Box::pin(async move {
+                request.validate()?;
+                let execution_request = request.into_run_only_execution_request()?;
+                let execution_report = backend.execute(execution_request).await?;
+                Ok(build_run_only_judge_job_report(request, execution_report))
+            })
+        }
     }
 
     fn sample_config() -> ExecutionConfig {
@@ -707,6 +1155,21 @@ enable_rootfs = false
 "#,
         )
         .expect("config should parse")
+    }
+
+    fn sample_judge_job_request() -> JudgeJobRequest {
+        JudgeJobRequest {
+            request_id: "judge-run-001".to_string(),
+            artifact_dir: Some("/tmp/sandbox-api/judge-run-001".into()),
+            compile: None,
+            run: JudgeStageRequest {
+                config: sample_config(),
+                command_override: Some(vec!["/bin/echo".to_string(), "judge".to_string()]),
+                artifact_dir: None,
+                inputs: JudgeStageInputs::default(),
+            },
+            checker: None,
+        }
     }
 
     async fn response_json<T: DeserializeOwned>(response: Response) -> T {
@@ -846,6 +1309,91 @@ enable_rootfs = false
         assert_eq!(body.result.status, ExecutionStatus::Ok);
         assert_eq!(body.audit_events.len(), 1);
         assert_eq!(body.audit_events[0].stage, "completed");
+    }
+
+    #[tokio::test]
+    async fn judge_job_run_only_returns_report() {
+        let app = build_router(TestBackend);
+        let payload = serde_json::to_vec(&sample_judge_job_request()).unwrap();
+        let response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/judge-jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: JudgeJobReport = response_json(response).await;
+        assert_eq!(body.request.request_id, "judge-run-001");
+        assert_eq!(body.status, JudgeJobStatus::Completed);
+        assert!(body.compile.is_none());
+        assert!(body.checker.is_none());
+        assert_eq!(body.run.stage, JudgeStageName::Run);
+        assert_eq!(body.run.status, JudgeStageStatus::Completed);
+        assert_eq!(
+            body.run.artifact_dir,
+            Some(PathBuf::from("/tmp/sandbox-api/judge-run-001/run"))
+        );
+        assert_eq!(
+            body.run
+                .result
+                .as_ref()
+                .map(|result| result.command.clone())
+                .unwrap(),
+            vec!["/bin/echo".to_string(), "judge".to_string()]
+        );
+        assert_eq!(body.run.artifacts.len(), 2);
+        assert_eq!(body.run.artifacts[0].kind, JudgeArtifactKind::Stdout);
+        assert_eq!(body.run.artifacts[1].kind, JudgeArtifactKind::Stderr);
+    }
+
+    #[tokio::test]
+    async fn judge_job_rejects_multi_stage_pipeline_until_backend_support_lands() {
+        let app = build_router(TestBackend);
+        let mut request = sample_judge_job_request();
+        request.compile = Some(JudgeStageRequest {
+            config: sample_config(),
+            command_override: Some(vec![
+                "/usr/bin/make".to_string(),
+                "-C".to_string(),
+                "/workspace".to_string(),
+            ]),
+            artifact_dir: None,
+            inputs: JudgeStageInputs::default(),
+        });
+        request
+            .run
+            .inputs
+            .readonly_artifacts
+            .push(JudgeArtifactRef {
+                stage: JudgeStageName::Compile,
+                artifact_path: PathBuf::from("outputs/main"),
+            });
+
+        let payload = serde_json::to_vec(&request).unwrap();
+        let response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/judge-jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body: ErrorResponse = response_json(response).await;
+        assert_eq!(body.error.code, "judge_job_not_implemented");
+        assert_eq!(
+            body.error.message,
+            "multi-stage judge jobs with `compile` or `checker` are not implemented yet"
+        );
+        assert_eq!(body.error.request_id.as_deref(), Some("judge-run-001"));
     }
 
     #[tokio::test]
