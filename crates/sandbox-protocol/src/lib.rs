@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -13,8 +14,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use sandbox_config::ExecutionConfig;
-use sandbox_core::{ExecutionResult, ResourceLimits, SandboxError};
-use sandbox_supervisor::{NamespaceSupport, RunOptions, probe_namespace_support, run};
+use sandbox_core::{
+    CompilationResult, CompilationStatus, ExecutionResult, ExecutionStatus, ResourceLimits,
+    SandboxError,
+};
+use sandbox_supervisor::{
+    CompileOptions, NamespaceSupport, RunOptions, compile, planned_artifact_dir,
+    probe_namespace_support, run,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::info;
@@ -28,6 +35,19 @@ pub trait ProtocolBackend: Send + Sync + 'static {
         &self,
         request: ValidateConfigRequest,
     ) -> BackendFuture<Result<ValidateConfigResponse, ProtocolError>>;
+    fn compile(
+        &self,
+        request: CompilationRequest,
+    ) -> BackendFuture<Result<CompilationReport, ProtocolError>> {
+        Box::pin(async move {
+            Err(ProtocolError::new(
+                StatusCode::NOT_IMPLEMENTED,
+                "compile_not_implemented",
+                "compilation is not implemented by this backend",
+                Some(request.request_id),
+            ))
+        })
+    }
     fn execute(
         &self,
         request: ExecutionRequest,
@@ -67,6 +87,27 @@ pub struct AuditEvent {
 pub struct ExecutionReport {
     pub request: ExecutionRequest,
     pub result: ExecutionResult,
+    pub audit_events: Vec<AuditEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationRequest {
+    pub request_id: String,
+    pub config: ExecutionConfig,
+    #[serde(default)]
+    pub command_override: Option<Vec<String>>,
+    #[serde(default)]
+    pub artifact_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub source_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationReport {
+    pub request: CompilationRequest,
+    pub result: CompilationResult,
     pub audit_events: Vec<AuditEvent>,
 }
 
@@ -187,6 +228,8 @@ pub struct JudgeStageReport {
     pub artifact_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<ExecutionResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compilation_result: Option<CompilationResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<JudgeStageArtifact>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -248,6 +291,22 @@ impl JudgeJobRequest {
                     .as_ref()
                     .map(|root| root.join(stage.as_str()))
             })
+    }
+
+    fn resolved_stage_artifact_dir(&self, stage: JudgeStageName) -> PathBuf {
+        self.stage_artifact_dir(stage).unwrap_or_else(|| {
+            let stage_request = self
+                .stage_request(stage)
+                .expect("resolved_stage_artifact_dir requires a defined stage");
+            planned_artifact_dir(
+                &stage_request.config,
+                &RunOptions {
+                    argv_override: stage_request.command_override.clone(),
+                    artifact_dir: None,
+                    cgroup_root_override: None,
+                },
+            )
+        })
     }
 
     fn validate_stage_request(
@@ -318,19 +377,6 @@ impl JudgeJobRequest {
         }
 
         validate_relative_artifact_path(&self.request_id, current_stage, &reference.artifact_path)
-    }
-
-    fn into_run_only_execution_request(&self) -> Result<ExecutionRequest, ProtocolError> {
-        if self.compile.is_some() || self.checker.is_some() {
-            return Err(judge_job_pipeline_not_implemented_error(&self.request_id));
-        }
-
-        Ok(ExecutionRequest {
-            request_id: self.request_id.clone(),
-            config: self.run.config.clone(),
-            command_override: self.run.command_override.clone(),
-            artifact_dir: self.stage_artifact_dir(JudgeStageName::Run),
-        })
     }
 }
 
@@ -599,24 +645,6 @@ fn task_not_found_error(task_id: &str) -> ProtocolError {
     )
 }
 
-fn judge_job_pipeline_not_implemented_error(request_id: &str) -> ProtocolError {
-    ProtocolError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "judge_job_not_implemented",
-        "multi-stage judge jobs with `compile` or `checker` are not implemented yet",
-        Some(request_id.to_string()),
-    )
-}
-
-fn judge_job_status_from_execution_status(
-    status: &sandbox_core::ExecutionStatus,
-) -> JudgeJobStatus {
-    match status {
-        sandbox_core::ExecutionStatus::Ok => JudgeJobStatus::Completed,
-        _ => JudgeJobStatus::Failed,
-    }
-}
-
 fn build_judge_stage_artifacts(
     artifact_dir: Option<&Path>,
     stage_request: &JudgeStageRequest,
@@ -649,41 +677,566 @@ fn build_judge_stage_artifacts(
     artifacts
 }
 
-fn build_run_only_judge_job_report(
-    request: JudgeJobRequest,
-    execution_report: ExecutionReport,
-) -> JudgeJobReport {
-    let stage_artifact_dir = execution_report
-        .request
-        .artifact_dir
-        .clone()
-        .or_else(|| request.stage_artifact_dir(JudgeStageName::Run));
-    let run_request = request.run.clone();
-    let stage_artifacts = build_judge_stage_artifacts(
-        stage_artifact_dir.as_deref(),
-        &run_request,
-        &execution_report.result,
-    );
-    let stage_audit_events = execution_report.audit_events.clone();
-    let status = judge_job_status_from_execution_status(&execution_report.result.status);
+#[derive(Debug, Clone, Default)]
+struct MaterializedStageInputs {
+    stdin_path: Option<PathBuf>,
+    readonly_bind_paths: Vec<PathBuf>,
+}
 
-    JudgeJobReport {
+fn stage_status_from_execution_status(status: &ExecutionStatus) -> JudgeStageStatus {
+    match status {
+        ExecutionStatus::Ok => JudgeStageStatus::Completed,
+        ExecutionStatus::TimeLimitExceeded
+        | ExecutionStatus::WallTimeLimitExceeded
+        | ExecutionStatus::MemoryLimitExceeded
+        | ExecutionStatus::OutputLimitExceeded
+        | ExecutionStatus::RuntimeError
+        | ExecutionStatus::SandboxError => JudgeStageStatus::Failed,
+    }
+}
+
+fn stage_status_from_compilation_status(status: &CompilationStatus) -> JudgeStageStatus {
+    match status {
+        CompilationStatus::Ok => JudgeStageStatus::Completed,
+        CompilationStatus::CompilationFailed
+        | CompilationStatus::TimeLimitExceeded
+        | CompilationStatus::WallTimeLimitExceeded
+        | CompilationStatus::MemoryLimitExceeded
+        | CompilationStatus::OutputLimitExceeded
+        | CompilationStatus::SandboxError => JudgeStageStatus::Failed,
+    }
+}
+
+fn judge_job_status_from_stage_reports(
+    compile: Option<&JudgeStageReport>,
+    run: &JudgeStageReport,
+    checker: Option<&JudgeStageReport>,
+) -> JudgeJobStatus {
+    let compile_ok = compile
+        .map(|report| report.status == JudgeStageStatus::Completed)
+        .unwrap_or(true);
+    let run_ok = run.status == JudgeStageStatus::Completed;
+    let checker_ok = checker
+        .map(|report| report.status == JudgeStageStatus::Completed)
+        .unwrap_or(true);
+
+    if compile_ok && run_ok && checker_ok {
+        JudgeJobStatus::Completed
+    } else {
+        JudgeJobStatus::Failed
+    }
+}
+
+fn stage_event(stage: JudgeStageName, suffix: &str, message: impl Into<String>) -> AuditEvent {
+    AuditEvent {
+        stage: format!("{}_{}", stage.as_str(), suffix),
+        message: message.into(),
+    }
+}
+
+fn resolved_execution_request(
+    request_id: &str,
+    stage_request: &JudgeStageRequest,
+    artifact_dir: PathBuf,
+    inputs: &MaterializedStageInputs,
+) -> ExecutionRequest {
+    let mut config = stage_request.config.clone();
+    if let Some(stdin_path) = inputs.stdin_path.as_ref() {
+        config.io.stdin_path = Some(stdin_path.clone());
+    }
+    if !inputs.readonly_bind_paths.is_empty() {
+        config
+            .filesystem
+            .readonly_bind_paths
+            .extend(inputs.readonly_bind_paths.iter().cloned());
+    }
+
+    ExecutionRequest {
+        request_id: request_id.to_string(),
+        config,
+        command_override: stage_request.command_override.clone(),
+        artifact_dir: Some(artifact_dir),
+    }
+}
+
+fn resolved_compilation_request(
+    request_id: &str,
+    stage_request: &JudgeStageRequest,
+    artifact_dir: PathBuf,
+) -> CompilationRequest {
+    let output_dir = if stage_request.config.filesystem.enable_rootfs {
+        None
+    } else {
+        Some(artifact_dir.join("outputs"))
+    };
+
+    CompilationRequest {
+        request_id: request_id.to_string(),
+        config: stage_request.config.clone(),
+        command_override: stage_request.command_override.clone(),
+        artifact_dir: Some(artifact_dir),
+        source_dir: None,
+        output_dir,
+    }
+}
+
+fn resolve_stage_artifact_source(
+    request_id: &str,
+    current_stage: JudgeStageName,
+    reference: &JudgeArtifactRef,
+    previous_stage_artifacts: &HashMap<JudgeStageName, PathBuf>,
+) -> Result<PathBuf, ProtocolError> {
+    let artifact_dir = previous_stage_artifacts
+        .get(&reference.stage)
+        .ok_or_else(|| {
+            ProtocolError::new(
+                StatusCode::CONFLICT,
+                "missing_artifact",
+                format!(
+                    "judge stage `{}` cannot resolve artifacts for missing `{}` stage output",
+                    current_stage.as_str(),
+                    reference.stage.as_str()
+                ),
+                Some(request_id.to_string()),
+            )
+        })?;
+    let source = artifact_dir.join(&reference.artifact_path);
+    if !source.exists() {
+        return Err(ProtocolError::new(
+            StatusCode::CONFLICT,
+            "missing_artifact",
+            format!(
+                "judge stage `{}` could not find referenced artifact `{}` from stage `{}`",
+                current_stage.as_str(),
+                reference.artifact_path.display(),
+                reference.stage.as_str()
+            ),
+            Some(request_id.to_string()),
+        ));
+    }
+
+    Ok(source)
+}
+
+fn copy_artifact_path(source: &Path, destination: &Path) -> Result<(), ProtocolError> {
+    if source.is_dir() {
+        fs::create_dir_all(destination).map_err(|err| {
+            ProtocolError::from(SandboxError::io(
+                "creating staged judge input directory",
+                err,
+            ))
+        })?;
+        for entry in fs::read_dir(source).map_err(|err| {
+            ProtocolError::from(SandboxError::io("reading judge input directory", err))
+        })? {
+            let entry = entry.map_err(|err| {
+                ProtocolError::from(SandboxError::io("reading judge input directory entry", err))
+            })?;
+            copy_artifact_path(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            ProtocolError::from(SandboxError::io("creating staged judge input parent", err))
+        })?;
+    }
+    fs::copy(source, destination)
+        .map_err(|err| ProtocolError::from(SandboxError::io("copying staged judge input", err)))?;
+    Ok(())
+}
+
+fn materialize_stage_inputs(
+    request_id: &str,
+    current_stage: JudgeStageName,
+    current_artifact_dir: &Path,
+    inputs: &JudgeStageInputs,
+    previous_stage_artifacts: &HashMap<JudgeStageName, PathBuf>,
+) -> Result<MaterializedStageInputs, ProtocolError> {
+    if inputs.stdin.is_none() && inputs.readonly_artifacts.is_empty() {
+        return Ok(MaterializedStageInputs::default());
+    }
+
+    let staged_inputs_root = current_artifact_dir.join("stage-inputs");
+    if staged_inputs_root.exists() {
+        fs::remove_dir_all(&staged_inputs_root).map_err(|err| {
+            ProtocolError::from(SandboxError::io("removing stale staged judge inputs", err))
+        })?;
+    }
+
+    let mut stdin_path = None;
+    let mut readonly_bind_paths = Vec::new();
+    let mut readonly_roots_seen = HashSet::new();
+
+    if let Some(reference) = inputs.stdin.as_ref() {
+        let source = resolve_stage_artifact_source(
+            request_id,
+            current_stage,
+            reference,
+            previous_stage_artifacts,
+        )?;
+        let destination = staged_inputs_root
+            .join(reference.stage.as_str())
+            .join(&reference.artifact_path);
+        copy_artifact_path(&source, &destination)?;
+        stdin_path = Some(destination);
+    }
+
+    for reference in &inputs.readonly_artifacts {
+        let source = resolve_stage_artifact_source(
+            request_id,
+            current_stage,
+            reference,
+            previous_stage_artifacts,
+        )?;
+        let root = staged_inputs_root.join(reference.stage.as_str());
+        let destination = root.join(&reference.artifact_path);
+        copy_artifact_path(&source, &destination)?;
+        if readonly_roots_seen.insert(root.clone()) {
+            readonly_bind_paths.push(root);
+        }
+    }
+
+    Ok(MaterializedStageInputs {
+        stdin_path,
+        readonly_bind_paths,
+    })
+}
+
+fn build_compilation_stage_artifacts(result: &CompilationResult) -> Vec<JudgeStageArtifact> {
+    let mut artifacts = vec![
+        JudgeStageArtifact {
+            name: "stdout".to_string(),
+            kind: JudgeArtifactKind::Stdout,
+            path: result.stdout_path.clone(),
+        },
+        JudgeStageArtifact {
+            name: "stderr".to_string(),
+            kind: JudgeArtifactKind::Stderr,
+            path: result.stderr_path.clone(),
+        },
+        JudgeStageArtifact {
+            name: "outputs".to_string(),
+            kind: JudgeArtifactKind::OutputDirectory,
+            path: result.output_dir.clone(),
+        },
+    ];
+
+    for output in &result.outputs {
+        let name = output
+            .strip_prefix(&result.output_dir)
+            .ok()
+            .map(|path| path.display().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| output.display().to_string());
+        artifacts.push(JudgeStageArtifact {
+            name,
+            kind: JudgeArtifactKind::File,
+            path: output.clone(),
+        });
+    }
+
+    artifacts
+}
+
+fn failed_stage_report(
+    stage: JudgeStageName,
+    request: JudgeStageRequest,
+    artifact_dir: PathBuf,
+    error: ProtocolError,
+) -> JudgeStageReport {
+    JudgeStageReport {
+        stage,
+        request,
+        status: JudgeStageStatus::Failed,
+        artifact_dir: Some(artifact_dir),
+        result: None,
+        compilation_result: None,
+        artifacts: Vec::new(),
+        audit_events: vec![stage_event(
+            stage,
+            "failed",
+            format!("stage failed before completion: {}", error.message),
+        )],
+        error: Some(error_detail_from_protocol_error(error, None)),
+    }
+}
+
+fn skipped_stage_report(
+    stage: JudgeStageName,
+    request: JudgeStageRequest,
+    artifact_dir: PathBuf,
+    reason: impl Into<String>,
+) -> JudgeStageReport {
+    let reason = reason.into();
+    JudgeStageReport {
+        stage,
+        request,
+        status: JudgeStageStatus::Skipped,
+        artifact_dir: Some(artifact_dir),
+        result: None,
+        compilation_result: None,
+        artifacts: Vec::new(),
+        audit_events: vec![stage_event(stage, "skipped", reason.clone())],
+        error: Some(ErrorDetail {
+            code: "stage_skipped".to_string(),
+            message: reason,
+            request_id: None,
+        }),
+    }
+}
+
+async fn execute_compile_stage<B: ProtocolBackend>(
+    backend: &B,
+    request_id: &str,
+    stage_request: JudgeStageRequest,
+    artifact_dir: PathBuf,
+) -> JudgeStageReport {
+    let compile_request =
+        resolved_compilation_request(request_id, &stage_request, artifact_dir.clone());
+
+    match backend.compile(compile_request).await {
+        Ok(report) => {
+            let stage_artifact_dir = report.request.artifact_dir.clone().or(Some(artifact_dir));
+            JudgeStageReport {
+                stage: JudgeStageName::Compile,
+                request: stage_request,
+                status: stage_status_from_compilation_status(&report.result.status),
+                artifact_dir: stage_artifact_dir,
+                result: None,
+                compilation_result: Some(report.result.clone()),
+                artifacts: build_compilation_stage_artifacts(&report.result),
+                audit_events: report.audit_events,
+                error: None,
+            }
+        }
+        Err(error) => {
+            failed_stage_report(JudgeStageName::Compile, stage_request, artifact_dir, error)
+        }
+    }
+}
+
+async fn execute_execution_stage<B: ProtocolBackend>(
+    backend: &B,
+    request_id: &str,
+    stage: JudgeStageName,
+    stage_request: JudgeStageRequest,
+    artifact_dir: PathBuf,
+    previous_stage_artifacts: &HashMap<JudgeStageName, PathBuf>,
+) -> JudgeStageReport {
+    let materialized_inputs = match materialize_stage_inputs(
+        request_id,
+        stage,
+        &artifact_dir,
+        &stage_request.inputs,
+        previous_stage_artifacts,
+    ) {
+        Ok(value) => value,
+        Err(error) => return failed_stage_report(stage, stage_request, artifact_dir, error),
+    };
+    let execution_request = resolved_execution_request(
+        request_id,
+        &stage_request,
+        artifact_dir.clone(),
+        &materialized_inputs,
+    );
+
+    match backend.execute(execution_request).await {
+        Ok(report) => {
+            let stage_artifact_dir = report.request.artifact_dir.clone().or(Some(artifact_dir));
+            let artifacts = build_judge_stage_artifacts(
+                stage_artifact_dir.as_deref(),
+                &stage_request,
+                &report.result,
+            );
+            JudgeStageReport {
+                stage,
+                request: stage_request,
+                status: stage_status_from_execution_status(&report.result.status),
+                artifact_dir: stage_artifact_dir,
+                result: Some(report.result.clone()),
+                compilation_result: None,
+                artifacts,
+                audit_events: report.audit_events,
+                error: None,
+            }
+        }
+        Err(error) => failed_stage_report(stage, stage_request, artifact_dir, error),
+    }
+}
+
+async fn execute_judge_job_with_backend<B: ProtocolBackend>(
+    backend: &B,
+    request: JudgeJobRequest,
+) -> Result<JudgeJobReport, ProtocolError> {
+    request.validate()?;
+
+    let mut audit_events = vec![AuditEvent {
+        stage: "accepted".to_string(),
+        message: "judge job accepted".to_string(),
+    }];
+    let mut previous_stage_artifacts = HashMap::new();
+
+    let compile_report = if let Some(compile_request) = request.compile.clone() {
+        let compile_artifact_dir = request.resolved_stage_artifact_dir(JudgeStageName::Compile);
+        audit_events.push(stage_event(
+            JudgeStageName::Compile,
+            "started",
+            "compile stage started",
+        ));
+        let report = execute_compile_stage(
+            backend,
+            &request.request_id,
+            compile_request,
+            compile_artifact_dir,
+        )
+        .await;
+        if report.status == JudgeStageStatus::Completed {
+            if let Some(artifact_dir) = report.artifact_dir.clone() {
+                previous_stage_artifacts.insert(JudgeStageName::Compile, artifact_dir);
+            }
+            audit_events.push(stage_event(
+                JudgeStageName::Compile,
+                "completed",
+                "compile stage completed",
+            ));
+        } else {
+            audit_events.push(stage_event(
+                JudgeStageName::Compile,
+                "failed",
+                "compile stage failed",
+            ));
+        }
+        Some(report)
+    } else {
+        None
+    };
+
+    let run_report = if compile_report
+        .as_ref()
+        .is_some_and(|report| report.status != JudgeStageStatus::Completed)
+    {
+        let report = skipped_stage_report(
+            JudgeStageName::Run,
+            request.run.clone(),
+            request.resolved_stage_artifact_dir(JudgeStageName::Run),
+            "run stage skipped because compile stage did not complete successfully",
+        );
+        audit_events.push(stage_event(
+            JudgeStageName::Run,
+            "skipped",
+            "run stage skipped",
+        ));
+        report
+    } else {
+        let run_artifact_dir = request.resolved_stage_artifact_dir(JudgeStageName::Run);
+        audit_events.push(stage_event(
+            JudgeStageName::Run,
+            "started",
+            "run stage started",
+        ));
+        let report = execute_execution_stage(
+            backend,
+            &request.request_id,
+            JudgeStageName::Run,
+            request.run.clone(),
+            run_artifact_dir,
+            &previous_stage_artifacts,
+        )
+        .await;
+        if report.status == JudgeStageStatus::Completed {
+            if let Some(artifact_dir) = report.artifact_dir.clone() {
+                previous_stage_artifacts.insert(JudgeStageName::Run, artifact_dir);
+            }
+            audit_events.push(stage_event(
+                JudgeStageName::Run,
+                "completed",
+                "run stage completed",
+            ));
+        } else {
+            audit_events.push(stage_event(
+                JudgeStageName::Run,
+                "failed",
+                "run stage failed",
+            ));
+        }
+        report
+    };
+
+    let checker_report = if let Some(checker_request) = request.checker.clone() {
+        if run_report.status != JudgeStageStatus::Completed {
+            let report = skipped_stage_report(
+                JudgeStageName::Checker,
+                checker_request.clone(),
+                request.resolved_stage_artifact_dir(JudgeStageName::Checker),
+                "checker stage skipped because run stage did not complete successfully",
+            );
+            audit_events.push(stage_event(
+                JudgeStageName::Checker,
+                "skipped",
+                "checker stage skipped",
+            ));
+            Some(report)
+        } else {
+            let checker_artifact_dir = request.resolved_stage_artifact_dir(JudgeStageName::Checker);
+            audit_events.push(stage_event(
+                JudgeStageName::Checker,
+                "started",
+                "checker stage started",
+            ));
+            let report = execute_execution_stage(
+                backend,
+                &request.request_id,
+                JudgeStageName::Checker,
+                checker_request,
+                checker_artifact_dir,
+                &previous_stage_artifacts,
+            )
+            .await;
+            if report.status == JudgeStageStatus::Completed {
+                audit_events.push(stage_event(
+                    JudgeStageName::Checker,
+                    "completed",
+                    "checker stage completed",
+                ));
+            } else {
+                audit_events.push(stage_event(
+                    JudgeStageName::Checker,
+                    "failed",
+                    "checker stage failed",
+                ));
+            }
+            Some(report)
+        }
+    } else {
+        None
+    };
+
+    let status = judge_job_status_from_stage_reports(
+        compile_report.as_ref(),
+        &run_report,
+        checker_report.as_ref(),
+    );
+    audit_events.push(AuditEvent {
+        stage: "completed".to_string(),
+        message: format!(
+            "judge job finished with status `{}`",
+            match status {
+                JudgeJobStatus::Completed => "completed",
+                JudgeJobStatus::Failed => "failed",
+            }
+        ),
+    });
+
+    Ok(JudgeJobReport {
         request,
         status,
-        compile: None,
-        run: JudgeStageReport {
-            stage: JudgeStageName::Run,
-            request: run_request,
-            status: JudgeStageStatus::Completed,
-            artifact_dir: stage_artifact_dir,
-            result: Some(execution_report.result),
-            artifacts: stage_artifacts,
-            audit_events: stage_audit_events,
-            error: None,
-        },
-        checker: None,
-        audit_events: execution_report.audit_events,
-    }
+        compile: compile_report,
+        run: run_report,
+        checker: checker_report,
+        audit_events,
+    })
 }
 
 fn error_detail_from_protocol_error(
@@ -933,6 +1486,77 @@ impl ProtocolBackend for SupervisorBackend {
         })
     }
 
+    fn compile(
+        &self,
+        request: CompilationRequest,
+    ) -> BackendFuture<Result<CompilationReport, ProtocolError>> {
+        Box::pin(async move {
+            let request_id = request.request_id.clone();
+            request.config.validate().map_err(|err| {
+                let mut mapped = ProtocolError::from(err);
+                mapped.request_id = Some(request_id.clone());
+                mapped
+            })?;
+
+            let compile_request = request.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                compile(
+                    &compile_request.config,
+                    &CompileOptions {
+                        argv_override: compile_request.command_override.clone(),
+                        artifact_dir: compile_request.artifact_dir.clone(),
+                        cgroup_root_override: None,
+                        source_dir: compile_request.source_dir.clone(),
+                        output_dir: compile_request.output_dir.clone(),
+                    },
+                )
+            })
+            .await
+            .map_err(|err| {
+                ProtocolError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("sandbox compilation task failed to join: {err}"),
+                    Some(request_id.clone()),
+                )
+            })?
+            .map_err(|err| {
+                let mut mapped = ProtocolError::from(err);
+                mapped.request_id = Some(request_id.clone());
+                mapped
+            })?;
+
+            Ok(CompilationReport {
+                request: CompilationRequest {
+                    artifact_dir: request.artifact_dir.or_else(|| {
+                        Some(planned_artifact_dir(
+                            &request.config,
+                            &RunOptions {
+                                argv_override: request.command_override.clone(),
+                                artifact_dir: None,
+                                cgroup_root_override: None,
+                            },
+                        ))
+                    }),
+                    source_dir: Some(result.source_dir.clone()),
+                    output_dir: Some(result.output_dir.clone()),
+                    ..request
+                },
+                result,
+                audit_events: vec![
+                    AuditEvent {
+                        stage: "accepted".to_string(),
+                        message: "compilation request accepted".to_string(),
+                    },
+                    AuditEvent {
+                        stage: "completed".to_string(),
+                        message: "compilation finished".to_string(),
+                    },
+                ],
+            })
+        })
+    }
+
     fn execute(
         &self,
         request: ExecutionRequest,
@@ -970,9 +1594,22 @@ impl ProtocolBackend for SupervisorBackend {
                 mapped.request_id = Some(request_id.clone());
                 mapped
             })?;
+            let resolved_artifact_dir = request.artifact_dir.clone().or_else(|| {
+                Some(planned_artifact_dir(
+                    &request.config,
+                    &RunOptions {
+                        argv_override: request.command_override.clone(),
+                        artifact_dir: None,
+                        cgroup_root_override: None,
+                    },
+                ))
+            });
 
             Ok(ExecutionReport {
-                request,
+                request: ExecutionRequest {
+                    artifact_dir: resolved_artifact_dir,
+                    ..request
+                },
                 result,
                 audit_events: vec![
                     AuditEvent {
@@ -993,12 +1630,7 @@ impl ProtocolBackend for SupervisorBackend {
         request: JudgeJobRequest,
     ) -> BackendFuture<Result<JudgeJobReport, ProtocolError>> {
         let backend = self.clone();
-        Box::pin(async move {
-            request.validate()?;
-            let execution_request = request.into_run_only_execution_request()?;
-            let execution_report = backend.execute(execution_request).await?;
-            Ok(build_run_only_judge_job_report(request, execution_report))
-        })
+        Box::pin(async move { execute_judge_job_with_backend(&backend, request).await })
     }
 }
 
@@ -1034,8 +1666,10 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
-    use sandbox_core::{ExecutionStatus, ResourceUsage};
+    use sandbox_core::{CompilationStatus, ExecutionStatus, ResourceUsage};
     use serde::de::DeserializeOwned;
+    use std::fs;
+    use std::sync::Mutex;
     use tokio::sync::Notify;
     use tower::util::ServiceExt;
 
@@ -1087,6 +1721,75 @@ mod tests {
             })
         }
 
+        fn compile(
+            &self,
+            request: CompilationRequest,
+        ) -> BackendFuture<Result<CompilationReport, ProtocolError>> {
+            Box::pin(async move {
+                if request.request_id == "bad-compile" {
+                    return Err(ProtocolError::new(
+                        StatusCode::BAD_REQUEST,
+                        "configuration",
+                        "bad compile request",
+                        Some(request.request_id),
+                    ));
+                }
+
+                let artifact_dir = request
+                    .artifact_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("/tmp/test-compile-artifacts"));
+                let output_dir = request
+                    .output_dir
+                    .clone()
+                    .unwrap_or_else(|| artifact_dir.join("outputs"));
+                fs::create_dir_all(&output_dir).unwrap();
+                fs::write(output_dir.join("program.txt"), "compiled output\n").unwrap();
+                fs::write(artifact_dir.join("stdout.log"), "compile stdout\n").unwrap();
+                fs::write(artifact_dir.join("stderr.log"), "").unwrap();
+
+                Ok(CompilationReport {
+                    request: CompilationRequest {
+                        artifact_dir: Some(artifact_dir.clone()),
+                        source_dir: Some(
+                            request
+                                .source_dir
+                                .clone()
+                                .unwrap_or_else(|| PathBuf::from(".")),
+                        ),
+                        output_dir: Some(output_dir.clone()),
+                        ..request.clone()
+                    },
+                    result: CompilationResult {
+                        command: request
+                            .command_override
+                            .clone()
+                            .unwrap_or_else(|| request.config.process.argv.clone()),
+                        source_dir: request
+                            .source_dir
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from(".")),
+                        output_dir: output_dir.clone(),
+                        outputs: vec![output_dir.join("program.txt")],
+                        exit_code: Some(0),
+                        term_signal: None,
+                        usage: ResourceUsage {
+                            cpu_time_ms: Some(1),
+                            wall_time_ms: 2,
+                            memory_peak_bytes: Some(3),
+                        },
+                        stdout_path: artifact_dir.join("stdout.log"),
+                        stderr_path: artifact_dir.join("stderr.log"),
+                        status: CompilationStatus::Ok,
+                    },
+                    audit_events: vec![AuditEvent {
+                        stage: "completed".to_string(),
+                        message: "compile finished".to_string(),
+                    }],
+                })
+            })
+        }
+
         fn execute(
             &self,
             request: ExecutionRequest,
@@ -1101,8 +1804,26 @@ mod tests {
                     ));
                 }
 
+                let artifact_dir = request
+                    .artifact_dir
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("/tmp/test-run-artifacts"));
+                fs::create_dir_all(&artifact_dir).unwrap();
+                let stdout_path = artifact_dir.join("stdout.log");
+                let stderr_path = artifact_dir.join("stderr.log");
+                let stdout_body = if let Some(stdin_path) = request.config.io.stdin_path.as_ref() {
+                    fs::read_to_string(stdin_path).unwrap_or_else(|_| "stdin missing\n".to_string())
+                } else {
+                    "test stdout\n".to_string()
+                };
+                fs::write(&stdout_path, stdout_body).unwrap();
+                fs::write(&stderr_path, "").unwrap();
+
                 Ok(ExecutionReport {
-                    request: request.clone(),
+                    request: ExecutionRequest {
+                        artifact_dir: Some(artifact_dir.clone()),
+                        ..request.clone()
+                    },
                     result: ExecutionResult {
                         command: request
                             .command_override
@@ -1115,8 +1836,8 @@ mod tests {
                             wall_time_ms: 2,
                             memory_peak_bytes: Some(3),
                         },
-                        stdout_path: "stdout.log".into(),
-                        stderr_path: "stderr.log".into(),
+                        stdout_path,
+                        stderr_path,
                         status: ExecutionStatus::Ok,
                     },
                     audit_events: vec![AuditEvent {
@@ -1132,12 +1853,7 @@ mod tests {
             request: JudgeJobRequest,
         ) -> BackendFuture<Result<JudgeJobReport, ProtocolError>> {
             let backend = self.clone();
-            Box::pin(async move {
-                request.validate()?;
-                let execution_request = request.into_run_only_execution_request()?;
-                let execution_report = backend.execute(execution_request).await?;
-                Ok(build_run_only_judge_job_report(request, execution_report))
-            })
+            Box::pin(async move { execute_judge_job_with_backend(&backend, request).await })
         }
     }
 
@@ -1169,6 +1885,47 @@ enable_rootfs = false
                 inputs: JudgeStageInputs::default(),
             },
             checker: None,
+        }
+    }
+
+    fn sample_multi_stage_judge_job_request() -> JudgeJobRequest {
+        JudgeJobRequest {
+            request_id: "judge-pipeline-001".to_string(),
+            artifact_dir: Some("/tmp/sandbox-api/judge-pipeline-001".into()),
+            compile: Some(JudgeStageRequest {
+                config: sample_config(),
+                command_override: Some(vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "compile".to_string(),
+                ]),
+                artifact_dir: None,
+                inputs: JudgeStageInputs::default(),
+            }),
+            run: JudgeStageRequest {
+                config: sample_config(),
+                command_override: Some(vec!["/bin/cat".to_string()]),
+                artifact_dir: None,
+                inputs: JudgeStageInputs {
+                    stdin: Some(JudgeArtifactRef {
+                        stage: JudgeStageName::Compile,
+                        artifact_path: PathBuf::from("outputs/program.txt"),
+                    }),
+                    readonly_artifacts: Vec::new(),
+                },
+            },
+            checker: Some(JudgeStageRequest {
+                config: sample_config(),
+                command_override: Some(vec!["/bin/cat".to_string()]),
+                artifact_dir: None,
+                inputs: JudgeStageInputs {
+                    stdin: Some(JudgeArtifactRef {
+                        stage: JudgeStageName::Run,
+                        artifact_path: PathBuf::from("stdout.log"),
+                    }),
+                    readonly_artifacts: Vec::new(),
+                },
+            }),
         }
     }
 
@@ -1352,28 +2109,9 @@ enable_rootfs = false
     }
 
     #[tokio::test]
-    async fn judge_job_rejects_multi_stage_pipeline_until_backend_support_lands() {
+    async fn judge_job_multi_stage_pipeline_returns_per_stage_reports() {
         let app = build_router(TestBackend);
-        let mut request = sample_judge_job_request();
-        request.compile = Some(JudgeStageRequest {
-            config: sample_config(),
-            command_override: Some(vec![
-                "/usr/bin/make".to_string(),
-                "-C".to_string(),
-                "/workspace".to_string(),
-            ]),
-            artifact_dir: None,
-            inputs: JudgeStageInputs::default(),
-        });
-        request
-            .run
-            .inputs
-            .readonly_artifacts
-            .push(JudgeArtifactRef {
-                stage: JudgeStageName::Compile,
-                artifact_path: PathBuf::from("outputs/main"),
-            });
-
+        let request = sample_multi_stage_judge_job_request();
         let payload = serde_json::to_vec(&request).unwrap();
         let response = send(
             &app,
@@ -1386,14 +2124,215 @@ enable_rootfs = false
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body: ErrorResponse = response_json(response).await;
-        assert_eq!(body.error.code, "judge_job_not_implemented");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: JudgeJobReport = response_json(response).await;
+        assert_eq!(body.status, JudgeJobStatus::Completed);
         assert_eq!(
-            body.error.message,
-            "multi-stage judge jobs with `compile` or `checker` are not implemented yet"
+            body.compile
+                .as_ref()
+                .and_then(|report| report.compilation_result.as_ref())
+                .map(|result| result.status.clone()),
+            Some(CompilationStatus::Ok)
         );
-        assert_eq!(body.error.request_id.as_deref(), Some("judge-run-001"));
+        assert_eq!(
+            body.run.result.as_ref().map(|result| result.status.clone()),
+            Some(ExecutionStatus::Ok)
+        );
+        assert_eq!(
+            body.checker
+                .as_ref()
+                .and_then(|report| report.result.as_ref())
+                .map(|result| result.status.clone()),
+            Some(ExecutionStatus::Ok)
+        );
+        assert_eq!(
+            body.compile
+                .as_ref()
+                .map(|report| report.artifact_dir.clone())
+                .flatten(),
+            Some(PathBuf::from("/tmp/sandbox-api/judge-pipeline-001/compile"))
+        );
+        assert_eq!(
+            body.run.artifact_dir,
+            Some(PathBuf::from("/tmp/sandbox-api/judge-pipeline-001/run"))
+        );
+        assert_eq!(
+            body.checker
+                .as_ref()
+                .map(|report| report.artifact_dir.clone())
+                .flatten(),
+            Some(PathBuf::from("/tmp/sandbox-api/judge-pipeline-001/checker"))
+        );
+        assert!(
+            body.audit_events
+                .iter()
+                .any(|event| event.stage == "compile_completed")
+        );
+        assert!(
+            body.audit_events
+                .iter()
+                .any(|event| event.stage == "checker_completed")
+        );
+    }
+
+    #[derive(Clone)]
+    struct CompileFailureBackend {
+        executed_stages: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CompileFailureBackend {
+        fn new() -> Self {
+            Self {
+                executed_stages: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl ProtocolBackend for CompileFailureBackend {
+        fn health(&self) -> BackendFuture<HealthStatus> {
+            Box::pin(async { HealthStatus::default() })
+        }
+
+        fn capabilities(&self) -> BackendFuture<CapabilitiesResponse> {
+            Box::pin(async {
+                CapabilitiesResponse {
+                    user_namespace: CapabilityStatus {
+                        available: true,
+                        reason: None,
+                    },
+                    mount_namespace: CapabilityStatus {
+                        available: true,
+                        reason: None,
+                    },
+                    pid_namespace: CapabilityStatus {
+                        available: true,
+                        reason: None,
+                    },
+                    network_namespace: CapabilityStatus {
+                        available: true,
+                        reason: None,
+                    },
+                    ipc_namespace: CapabilityStatus {
+                        available: true,
+                        reason: None,
+                    },
+                }
+            })
+        }
+
+        fn validate_config(
+            &self,
+            request: ValidateConfigRequest,
+        ) -> BackendFuture<Result<ValidateConfigResponse, ProtocolError>> {
+            Box::pin(async move {
+                request.config.validate().map_err(ProtocolError::from)?;
+                Ok(ValidateConfigResponse {
+                    valid: true,
+                    resource_limits: request.config.resource_limits(),
+                })
+            })
+        }
+
+        fn compile(
+            &self,
+            request: CompilationRequest,
+        ) -> BackendFuture<Result<CompilationReport, ProtocolError>> {
+            let executed_stages = Arc::clone(&self.executed_stages);
+            Box::pin(async move {
+                executed_stages.lock().unwrap().push("compile".to_string());
+                let artifact_dir = request.artifact_dir.clone().unwrap();
+                let output_dir = request.output_dir.clone().unwrap();
+                fs::create_dir_all(&output_dir).unwrap();
+                fs::write(output_dir.join("program.txt"), "broken output\n").unwrap();
+                fs::write(artifact_dir.join("stdout.log"), "").unwrap();
+                fs::write(artifact_dir.join("stderr.log"), "compile failed\n").unwrap();
+
+                Ok(CompilationReport {
+                    request: request.clone(),
+                    result: CompilationResult {
+                        command: request.config.process.argv.clone(),
+                        source_dir: request
+                            .source_dir
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from(".")),
+                        output_dir,
+                        outputs: vec![artifact_dir.join("outputs/program.txt")],
+                        exit_code: Some(1),
+                        term_signal: None,
+                        usage: ResourceUsage {
+                            cpu_time_ms: Some(1),
+                            wall_time_ms: 2,
+                            memory_peak_bytes: Some(3),
+                        },
+                        stdout_path: artifact_dir.join("stdout.log"),
+                        stderr_path: artifact_dir.join("stderr.log"),
+                        status: CompilationStatus::CompilationFailed,
+                    },
+                    audit_events: vec![AuditEvent {
+                        stage: "completed".to_string(),
+                        message: "compile finished".to_string(),
+                    }],
+                })
+            })
+        }
+
+        fn execute(
+            &self,
+            request: ExecutionRequest,
+        ) -> BackendFuture<Result<ExecutionReport, ProtocolError>> {
+            let executed_stages = Arc::clone(&self.executed_stages);
+            Box::pin(async move {
+                executed_stages.lock().unwrap().push(request.request_id);
+                Err(ProtocolError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "execute should not be called after compile failure",
+                    None,
+                ))
+            })
+        }
+
+        fn execute_judge_job(
+            &self,
+            request: JudgeJobRequest,
+        ) -> BackendFuture<Result<JudgeJobReport, ProtocolError>> {
+            let backend = self.clone();
+            Box::pin(async move { execute_judge_job_with_backend(&backend, request).await })
+        }
+    }
+
+    #[tokio::test]
+    async fn judge_job_stops_after_compile_failure_and_skips_later_stages() {
+        let backend = CompileFailureBackend::new();
+        let app = build_router(backend.clone());
+        let payload = serde_json::to_vec(&sample_multi_stage_judge_job_request()).unwrap();
+        let response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/judge-jobs")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: JudgeJobReport = response_json(response).await;
+        assert_eq!(body.status, JudgeJobStatus::Failed);
+        assert_eq!(
+            body.compile.as_ref().map(|report| report.status),
+            Some(JudgeStageStatus::Failed)
+        );
+        assert_eq!(body.run.status, JudgeStageStatus::Skipped);
+        assert_eq!(
+            body.checker.as_ref().map(|report| report.status),
+            Some(JudgeStageStatus::Skipped)
+        );
+        assert_eq!(
+            backend.executed_stages.lock().unwrap().as_slice(),
+            ["compile"]
+        );
     }
 
     #[tokio::test]

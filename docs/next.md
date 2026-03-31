@@ -16,8 +16,10 @@
   路由，现有 `/api/v1/executions` 保持兼容
 - [x] 已完成第 2 项：supervisor / CLI 已新增独立 `compile` 执行模型，可区分
   `compilation_failed` 与沙箱失败，并返回编译产物路径
-- [ ] 当前下一步：实现 checker 分层与阶段编排
-- [ ] 后续再继续接 artifact 下载和异步流式状态
+- [x] 已完成第 3 项：judge job 已支持 `compile -> run -> checker` 阶段编排，
+  任一阶段失败都会短路后续阶段，并返回逐阶段报告
+- [ ] 当前下一步：增加 artifact 索引和下载接口
+- [ ] 后续再继续接异步流式状态与任务清理
 
 ## 推荐顺序
 

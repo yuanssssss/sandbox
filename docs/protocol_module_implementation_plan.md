@@ -126,9 +126,10 @@
 
 - 保留现有 `/api/v1/executions` 作为单次执行入口
 - 新增 `/api/v1/judge-jobs` 作为多阶段协议入口
-- 当前实现先支持 run-only judge job，便于平滑迁移已有调用方
-- 当请求显式包含 `compile` 或 `checker` 阶段时，当前后端返回 `501 judge_job_not_implemented`
-  明确表示协议已定义、执行编排将在下一阶段落地
+- run-only judge job 仍然可用，便于平滑迁移已有调用方
+- 当前后端已经支持 `compile -> run -> checker` 顺序执行
+- 任一阶段失败都会停止后续阶段，并把未执行阶段标成 `skipped`
+- `stdin` artifact 引用会直接接到后续阶段输入，`readonly_artifacts` 会被物化到受控输入目录后再挂载
 
 请求体建议：
 
@@ -147,24 +148,21 @@
 
 ```json
 {
-  "request_id": "judge-cpp-001",
-  "artifact_dir": "/tmp/sandbox-api/judge-cpp-001",
+  "request_id": "judge-pipeline-001",
+  "artifact_dir": "/tmp/sandbox-api/judge-pipeline-001",
   "compile": {
+    "artifact_dir": "/tmp/sandbox-api/judge-pipeline-001/compile",
     "config": { "...": "ExecutionConfig" }
   },
   "run": {
     "inputs": {
-      "readonly_artifacts": [
-        { "stage": "compile", "artifact_path": "outputs/main" }
-      ]
+      "stdin": { "stage": "compile", "artifact_path": "outputs/program.txt" }
     },
     "config": { "...": "ExecutionConfig" }
   },
   "checker": {
     "inputs": {
-      "readonly_artifacts": [
-        { "stage": "run", "artifact_path": "stdout.log" }
-      ]
+      "stdin": { "stage": "run", "artifact_path": "stdout.log" }
     },
     "config": { "...": "ExecutionConfig" }
   }
@@ -177,18 +175,28 @@
 {
   "request": { "...": "JudgeJobRequest" },
   "status": "completed",
-  "compile": null,
+  "compile": {
+    "stage": "compile",
+    "status": "completed",
+    "artifact_dir": "/tmp/sandbox-api/judge-pipeline-001/compile",
+    "compilation_result": { "...": "CompilationResult" }
+  },
   "run": {
     "stage": "run",
     "status": "completed",
-    "artifact_dir": "/tmp/sandbox-api/judge-run-001/run",
+    "artifact_dir": "/tmp/sandbox-api/judge-pipeline-001/run",
     "result": { "...": "ExecutionResult" },
     "artifacts": [
       { "name": "stdout", "kind": "stdout", "path": "/tmp/.../stdout.log" },
       { "name": "stderr", "kind": "stderr", "path": "/tmp/.../stderr.log" }
     ]
   },
-  "checker": null
+  "checker": {
+    "stage": "checker",
+    "status": "completed",
+    "artifact_dir": "/tmp/sandbox-api/judge-pipeline-001/checker",
+    "result": { "...": "ExecutionResult" }
+  }
 }
 ```
 
@@ -238,14 +246,12 @@
 
 ## 8. 下一阶段扩展
 
-MVP 与多阶段协议模型完成后，建议按下面顺序继续扩展：
+MVP、多阶段协议模型和基础阶段编排完成后，建议按下面顺序继续扩展：
 
-1. 把 `compile` 从普通执行里独立出来，先真正执行编译阶段。
-2. 串起 `compile -> run -> checker` 阶段编排，并在阶段失败时停止后续阶段。
-3. 增加异步任务模型到 `judge-jobs`，返回 `202 Accepted` 与任务 ID。
-4. 增加阶段 artifact 索引与下载接口，例如 stdout/stderr/outputs 读取。
-5. 增加审计日志流式输出或 SSE。
-6. 增加鉴权、中间件、请求大小限制和并发限制。
+1. 增加阶段 artifact 索引与下载接口，例如 stdout/stderr/outputs 读取。
+2. 增加异步任务模型到 `judge-jobs`，返回 `202 Accepted` 与任务 ID。
+3. 增加审计日志流式输出或 SSE。
+4. 增加鉴权、中间件、请求大小限制和并发限制。
 
 ## 9. 当前实现结论
 
