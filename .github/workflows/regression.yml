@@ -21,5 +21,28 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Run cargo tests (default)
+        run: cargo test --workspace --all-targets
+
+      - name: Check namespace support for ignored tests
+        id: ns_support
+        shell: bash
+        run: |
+          set -euo pipefail
+          if unshare -Urnm true >/dev/null 2>&1; then
+            echo "supported=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "supported=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run cargo ignored tests
+        if: steps.ns_support.outputs.supported == 'true'
+        run: cargo test --workspace --all-targets -- --ignored
+
+      - name: Report skipped ignored tests
+        if: steps.ns_support.outputs.supported != 'true'
+        run: |
+          echo "Skipping ignored tests: user/mount namespace support is unavailable in this runner."
+
       - name: Run regression suite
         run: ./scripts/run_regression_suite.sh
